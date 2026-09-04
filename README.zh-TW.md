@@ -93,7 +93,7 @@ agy-orchestrator/
 
 ### 一鍵安裝
 ```bash
-git clone https://github.com/<your-username>/agy-orchestrator.git
+git clone https://github.com/tern/agy-orchestrator.git
 cd agy-orchestrator
 ./install.sh
 ```
