@@ -23,6 +23,7 @@ install -m 0644 "$SRC/agy/skills/model-router/SKILL.md" "$AGY_SKILL_DIR/SKILL.md
 render_worker() {
   local route="$1"
   local label="$2"
+  local dot="$3"
   local dir="${AGENTS_ROOT}/${route}"
   local dest="${dir}/agent.md"
   if [[ -f "$dest" ]] && ! grep -q "$MARKER" "$dest"; then
@@ -30,19 +31,22 @@ render_worker() {
     return 0
   fi
   mkdir -p "$dir"
-  sed -e "s/__NAME__/${route}/g" -e "s/__ROUTE__/${route}/g" -e "s/__MODEL_LABEL__/${label}/g" \
+  sed -e "s/__NAME__/${route}/g" -e "s/__ROUTE__/${route}/g" -e "s/__MODEL_LABEL__/${label}/g" -e "s/__DOT__/${dot}/g" \
     "$SRC/agy/templates/worker.md" > "$dest"
   chmod 0644 "$dest"
   echo "  + ${dest}"
 }
 
 echo "Rendering per-route worker agents:"
-render_worker haiku  "Claude Haiku 4.5"
-render_worker sonnet "Claude Sonnet 5"
-render_worker opus   "Claude Opus 5"
-render_worker luna   "GPT-5.6 Luna"
-render_worker terra  "GPT-5.6 Terra"
-render_worker sol    "GPT-5.6 Sol"
+# Claude labels carry no version number: the route already names the model, and a stale
+# version in the label is worse than none. The dot makes each worker's statusline row
+# tell itself apart from its siblings at a glance.
+render_worker haiku  "Claude Haiku" 🟢
+render_worker sonnet "Claude Sonnet" 🔵
+render_worker opus   "Claude Opus" 🟣
+render_worker luna   "GPT-5.6 Luna" 🟡
+render_worker terra  "GPT-5.6 Terra" 🟠
+render_worker sol    "GPT-5.6 Sol" 🔴
 if [[ ! -f "$CFG_DIR/models.env" ]]; then
   install -m 0600 "$SRC/config/models.env" "$CFG_DIR/models.env"
 else

@@ -22,7 +22,7 @@ tell at a glance which external model is running.
 ## The only thing you may do
 
 1. Run the single `agy-exec` command you were given, exactly as given, using `run_command`.
-   Set `toolSummary` to `__ROUTE__ 執行中` so the statusline stays informative.
+   Set `toolSummary` to `__DOT__ __ROUTE__ 執行中` so the statusline stays informative.
 2. Poll `manage_task` with `Action: "status"` until the task log ends with the sentinel line:
 
    ```
@@ -63,7 +63,7 @@ and commit code on the strength of a review that never happened.
 ## While waiting
 
 Keep polling. Between polls, say nothing but a short status line
-(e.g. `等待 __ROUTE__ 回報中（已 90 秒）`). Long waits are expected and correct.
+(e.g. `__DOT__ 等待 __ROUTE__ 回報中（已 90 秒）`). Long waits are expected and correct.
 
 ## Failure handling
 

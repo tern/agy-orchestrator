@@ -41,9 +41,21 @@ SENTINEL = "AGY_WORKER_END"
 
 # agy-exec may be invoked bare or by absolute path, and transcript values are sometimes
 # wrapped in a stray quote layer, so normalise before matching.
+#
+# Reading the run's own task log is part of the job, and workers do it with whatever
+# reader they like -- cat, tail, head, grep. What matters is that the target is that log
+# and nothing is piped into another command, so allow any plain reader pointed at it.
+# (Being literal about `cat` here produced three false alarms before this was widened.)
+LOG_READER = r"(?:cat|tail|head|grep|wc|sed|awk|cut|tr|less)"
+TASK_LOG = r"\S*/\.system_generated/tasks/task-\S+\.log"
 ALLOWED_WORKER_CMD = re.compile(
-    r"^\s*(\S*/)?(agy-exec\b|cat\s+\S*/tasks/task-\S+\.log\s*$|sleep\s+\d+\s*$)"
+    rf"^\s*(\S*/)?(agy-exec\b"
+    rf"|sleep\s+\d+\s*$"
+    rf"|{LOG_READER}\b[^|;&]*{TASK_LOG}[^|;&]*$)"
 )
+
+# A truncating read of a long log relays only part of the worker's report.
+TRUNCATING_READ = re.compile(rf"^\s*(?:tail|head)\s+-n\s+(\d+)\b[^|;&]*{TASK_LOG}")
 
 # Cost ladder tiers. agent.md: retry once at the same tier, then escalate one tier.
 TIER = {"luna": 1, "haiku": 1, "sonnet": 2, "terra": 2, "opus": 3, "sol": 3}
@@ -213,6 +225,32 @@ def dispatch_findings(tn, route, prompt):
     return out
 
 
+def truncated_relay(steps, logs):
+    """`tail -n 50` on a 12k-line log relays a fraction of the report. Flag it when the
+    last log read before reporting could not have covered the whole thing."""
+    last_n = None
+    for n, a in calls(steps):
+        if n != "run_command":
+            continue
+        m = TRUNCATING_READ.match(norm_cmd(a.get("CommandLine")))
+        if m:
+            last_n = int(m.group(1))
+        elif ALLOWED_WORKER_CMD.match(norm_cmd(a.get("CommandLine"))):
+            last_n = None          # a full read supersedes an earlier partial one
+    if last_n is None:
+        return []
+    out = []
+    for f in logs:
+        try:
+            lines = sum(1 for _ in open(f, errors="replace"))
+        except OSError:
+            continue
+        if lines > last_n:
+            out.append(("MED", f"worker 以 tail/head -n {last_n} 讀取 {lines} 行的 log → "
+                               f"轉述可能被截斷（{os.path.basename(f)}）"))
+    return out
+
+
 def task_logs(sid):
     return glob.glob(f"{BRAIN}/{sid}/.system_generated/tasks/task-*.log")
 
@@ -248,6 +286,8 @@ def audit(sid, since):
         big = [f for f in task_logs(sid) if os.path.getsize(f) > 400]
         done = [f for f in big if SENTINEL in open(f, errors="replace").read()]
         info.append(f"agy-exec 任務 log {len(big)} 個，其中 {len(done)} 個已出現哨符")
+        if sent:
+            issues.extend(truncated_relay(steps, task_logs(sid)))
         if stray:
             issues.append(("HIGH", "worker 執行非授權指令（代做徵兆）: "
                                    + "; ".join(c.replace("\n", " ")[:90] for c in stray[:3])))
