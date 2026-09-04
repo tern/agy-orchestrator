@@ -3,34 +3,34 @@ set -euo pipefail
 
 STATE_DIR="${AGY_ORCH_STATE_DIR:-$HOME/.local/share/agy-orchestrator}"
 RUNS_DIR="$STATE_DIR/runs"
+RESV_DIR="$STATE_DIR/reservations"
+LOCK_DIR="$STATE_DIR/.lock"
 CONFIG="${AGY_ORCH_MODELS_FILE:-$HOME/.config/agy-orchestrator/models.env}"
 
 usage() {
   cat <<'USAGE'
 agy-exec --model <haiku|sonnet|opus|luna|terra|sol> --task <text> [options]
-agy-exec apply <run-id> [--cwd <path>] [--check] [-- <file>...]
+agy-exec apply <run-id> [--cwd <path>] [--check] [--force] [-- <file>...]
 agy-exec runs [--task-id <id>] [--limit <n>]
 
 Delegate options:
   --cwd <path>                 Repository/project directory (default: pwd)
   --role <text>                Worker role label
   --mode <inspect|edit>        inspect = do not change files; edit = may change files
-  --isolation <worktree|shared> Default: worktree for Git repos, otherwise shared
+  --isolation <worktree|shared> Default: worktree for Git repos, otherwise shared.
+                               'edit' + 'shared' is refused inside a Git repo; pass
+                               --allow-shared-edit if you really mean to write in place.
   --task-id <id>               Budget/ledger grouping key for one unit of work.
                                Default: <repo-basename>-<YYYYMMDD>
   --output <path>              Save worker text to a file
   --keep-worktree              Keep temporary worktree for inspection
+  --allow-shared-edit          Permit --mode edit with --isolation shared in a Git repo
   -h, --help
 
 Every delegate run records $STATE_DIR/runs/<run-id>/{result.json,worker.diff,worker.txt}
-and appends one line to $STATE_DIR/runs/<date>.jsonl. Read result.json for control
-decisions (did it finish, what changed, what did it cost); read the report text for
-content. The last stdout line is always the completion sentinel.
-
-Examples:
-  agy-exec --model haiku --mode inspect --task "Find auth entry points"
-  agy-exec --model sonnet --mode edit --task-id PAY-123 --task "Implement token refresh"
-  agy-exec apply 20260904-171500-sonnet-a1b2 --check
+and appends one line to $STATE_DIR/runs/<date>.jsonl -- including runs that fail before a
+worker starts. Read result.json for control decisions; read the report text for content.
+The last stdout line is always the completion sentinel.
 USAGE
 }
 
@@ -55,16 +55,30 @@ load_config() {
   : "${CLAUDE_MAX_TURNS_EDIT:=60}"
 }
 
+# Budget accounting is read-modify-write across concurrent workers, so it needs a real
+# mutex. mkdir is the portable atomic primitive available in plain bash on macOS.
+lock_acquire() {
+  local waited=0
+  mkdir -p "$STATE_DIR"
+  until mkdir "$LOCK_DIR" 2>/dev/null; do
+    waited=$((waited + 1))
+    [[ $waited -gt 300 ]] && { rmdir "$LOCK_DIR" 2>/dev/null || true; continue; }
+    sleep 0.1
+  done
+}
+lock_release() { rmdir "$LOCK_DIR" 2>/dev/null || true; }
+
 # ---------------------------------------------------------------- apply ------
 
 cmd_apply() {
-  local run_id="" target="" check=0 files=()
+  local run_id="" target="" check=0 force=0 files=()
   [[ $# -gt 0 ]] || die "apply requires a run id"
   run_id="$1"; shift
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --cwd) target="$2"; shift 2 ;;
       --check) check=1; shift ;;
+      --force) force=1; shift ;;
       --) shift; files=("$@"); break ;;
       -h|--help) usage; exit 0 ;;
       *) die "Unknown apply argument: $1" ;;
@@ -75,19 +89,43 @@ cmd_apply() {
   [[ -d "$dir" ]] || die "No such run: $run_id (looked in $RUNS_DIR)"
   local diff="$dir/worker.diff"
   [[ -s "$diff" ]] || die "Run $run_id has no changes to apply"
+  [[ -f "$dir/result.json" ]] || die "Run $run_id has no result.json; refusing to apply"
 
-  if [[ -z "$target" ]]; then
-    target="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cwd"])' "$dir/result.json")"
+  local meta ok mode base scope
+  meta="$(python3 -c '
+import json, sys
+o = json.load(open(sys.argv[1]))
+print(o.get("ok"), o.get("mode"), o.get("base_commit") or "-", o.get("diff_scope") or "-", o.get("cwd"))
+' "$dir/result.json")"
+  read -r ok mode base scope target_default <<<"$meta"
+  [[ -z "$target" ]] && target="$target_default"
+
+  if [[ "$ok" != "True" && "$force" -eq 0 ]]; then
+    die "Run $run_id did not succeed (ok=$ok). Re-run it, or pass --force to apply anyway."
   fi
+  if [[ "$mode" != "edit" && "$force" -eq 0 ]]; then
+    die "Run $run_id was mode=$mode, so its diff is not worker-authored. Pass --force to apply anyway."
+  fi
+  if [[ "$scope" == "shared" && "$force" -eq 0 ]]; then
+    die "Run $run_id ran with shared isolation, so its diff may contain pre-existing local changes. Pass --force to apply anyway."
+  fi
+
   target="$(cd "$target" && pwd)"
   git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die "apply target is not a Git repository: $target"
 
-  # A worker diff is a proposal. Three-way merge it and stop on conflict rather than
-  # forcing it in: a half-applied patch is worse than a refused one.
+  # A dirty target turns a failed three-way merge into an unpickable mess: the user can no
+  # longer tell their own edits from the worker's.
+  if [[ "$check" -eq 0 && "$force" -eq 0 ]] && ! git -C "$target" diff --quiet HEAD 2>/dev/null; then
+    die "apply target has uncommitted changes: $target
+Commit or stash them first so a conflict stays attributable, or pass --force."
+  fi
+  if [[ "$base" != "-" ]] && ! git -C "$target" merge-base --is-ancestor "$base" HEAD 2>/dev/null; then
+    echo "note: run's base commit $base is not an ancestor of $target HEAD; three-way merge may conflict" >&2
+  fi
+
   local args=(-C "$target" apply --3way)
-  [[ ${#files[@]} -gt 0 ]] && args+=(--include="${files[0]}")
-  for f in "${files[@]:1}"; do args+=(--include="$f"); done
+  for f in "${files[@]}"; do args+=(--include="$f"); done
 
   if [[ "$check" -eq 1 ]]; then
     if git "${args[@]}" --check "$diff" 2>&1; then
@@ -103,7 +141,9 @@ cmd_apply() {
     echo "✅ applied run $run_id to $target (staged, not committed)"
     git -C "$target" status --short
   else
-    echo "⚠️  conflict applying run $run_id; working tree left for you to resolve" >&2
+    echo "⚠️  conflict applying run $run_id. git apply --3way is not atomic: files that" >&2
+    echo "    merged cleanly are staged, conflicted ones are left with markers." >&2
+    echo "    Resolve them, or 'git -C $target reset --hard' to discard the whole attempt." >&2
     return 1
   fi
 }
@@ -120,19 +160,20 @@ cmd_runs() {
       *) die "Unknown runs argument: $1" ;;
     esac
   done
-  python3 - "$RUNS_DIR" "$task_id" "$limit" <<'PY'
-import glob, json, os, sys
-runs_dir, task_id, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+  AGY_RUNS_DIR="$RUNS_DIR" AGY_TASK_ID="$task_id" AGY_LIMIT="$limit" python3 <<'PY'
+import glob, json, os
+runs_dir = os.environ["AGY_RUNS_DIR"]
+task_id = os.environ["AGY_TASK_ID"]
+limit = int(os.environ["AGY_LIMIT"])
 rows = []
 for f in sorted(glob.glob(os.path.join(runs_dir, "*.jsonl"))):
     for line in open(f, errors="replace"):
         line = line.strip()
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except Exception:
-            pass
+        if line:
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                pass
 if task_id:
     rows = [r for r in rows if r.get("task_id") == task_id]
 rows = rows[-limit:]
@@ -140,12 +181,11 @@ if not rows:
     print("(no runs recorded)")
     raise SystemExit
 total = sum(r.get("cost_usd") or 0 for r in rows)
-print(f"{'run id':<34} {'route':<7} {'mode':<8} {'exit':>4} {'cost':>8}  task-id")
+print(f"{'run id':<34} {'route':<7} {'mode':<8} {'exit':>4} {'cost':>9}  task-id")
 for r in rows:
-    cost = r.get("cost_usd")
+    c = r.get("cost_usd")
     print(f"{r.get('run_id',''):<34} {r.get('route',''):<7} {r.get('mode',''):<8} "
-          f"{r.get('exit',''):>4} {('$%.4f' % cost) if cost is not None else '       -':>8}  "
-          f"{r.get('task_id','')}")
+          f"{r.get('exit',''):>4} {('$%.4f' % c) if c is not None else '-':>9}  {r.get('task_id','')}")
 print(f"\n{len(rows)} runs, known cost ${total:.4f}")
 PY
 }
@@ -159,7 +199,7 @@ case "${1:-}" in
 esac
 
 MODEL_KEY=""; TASK=""; CWD="$(pwd)"; ROLE="worker"; MODE="inspect"
-ISOLATION=""; OUTPUT=""; KEEP_WORKTREE=0; TASK_ID=""
+ISOLATION=""; OUTPUT=""; KEEP_WORKTREE=0; TASK_ID=""; ALLOW_SHARED_EDIT=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -172,6 +212,7 @@ while [[ $# -gt 0 ]]; do
     --task-id) TASK_ID="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
     --keep-worktree) KEEP_WORKTREE=1; shift ;;
+    --allow-shared-edit) ALLOW_SHARED_EDIT=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -196,6 +237,18 @@ case "$MODEL_KEY" in
   *) die "Unknown model key: $MODEL_KEY" ;;
 esac
 
+IS_GIT=0
+git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 && IS_GIT=1
+[[ -z "$ISOLATION" ]] && { [[ $IS_GIT -eq 1 ]] && ISOLATION=worktree || ISOLATION=shared; }
+[[ "$ISOLATION" == "worktree" || "$ISOLATION" == "shared" ]] || die "Invalid --isolation"
+
+# An edit worker in shared isolation writes straight into the caller's tree, which is the
+# one thing the worktree default exists to prevent.
+if [[ "$MODE" == "edit" && "$ISOLATION" == "shared" && $IS_GIT -eq 1 && $ALLOW_SHARED_EDIT -eq 0 ]]; then
+  die "Refusing --mode edit with --isolation shared inside a Git repository.
+Omit --isolation to get worktree isolation, or pass --allow-shared-edit to override."
+fi
+
 if [[ "$MODE" == "inspect" ]]; then
   ACTION_RULE="READ-ONLY TASK. Do not modify, create, delete, rename, commit, or format files. Inspect and report only."
   MAX_TURNS="$CLAUDE_MAX_TURNS_INSPECT"
@@ -204,19 +257,111 @@ else
   MAX_TURNS="$CLAUDE_MAX_TURNS_EDIT"
 fi
 
-mkdir -p "$RUNS_DIR"
+mkdir -p "$RUNS_DIR" "$RESV_DIR"
 LEDGER="$RUNS_DIR/$(date +%F).jsonl"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-${MODEL_KEY}-$(printf '%04x' $((RANDOM % 65536)))"
 RUN_DIR="$RUNS_DIR/$RUN_ID"
 mkdir -p "$RUN_DIR"
+TXT_OUT="$RUN_DIR/worker.txt"; : > "$TXT_OUT"
+DIFF_FILE="$RUN_DIR/worker.diff"; : > "$DIFF_FILE"
+RESV_FILE="$RESV_DIR/$RUN_ID.json"
+BASE_COMMIT=""
+[[ $IS_GIT -eq 1 ]] && BASE_COMMIT="$(git -C "$CWD" rev-parse HEAD 2>/dev/null || true)"
 
-# Task budget is cumulative across every call sharing a --task-id. A per-call cap alone
-# lets one goal escalate through five routes and spend five times the "limit".
-SPENT="$(python3 - "$RUNS_DIR" "$TASK_ID" <<'PY'
-import glob, json, os, sys
-runs_dir, task_id = sys.argv[1], sys.argv[2]
-total = 0.0
-for f in glob.glob(os.path.join(runs_dir, "*.jsonl")):
+RESULT_WRITTEN=0
+# Every terminating path records a result, including the ones that fail before a worker
+# starts: a missing record is indistinguishable from a run that never happened.
+write_result() {
+  [[ "$RESULT_WRITTEN" -eq 1 ]] && return 0
+  RESULT_WRITTEN=1
+  lock_acquire
+  rm -f "$RESV_FILE"
+  AGY_RESULT_PATH="$RUN_DIR/result.json" AGY_LEDGER="$LEDGER" \
+  AGY_RUN_ID="$RUN_ID" AGY_TASK_ID="$TASK_ID" AGY_EXIT="${1:-1}" AGY_REASON="${2:-}" \
+  AGY_ROUTE="$MODEL_KEY" AGY_PROVIDER="$PROVIDER" AGY_MODEL="$MODEL" AGY_MODE="$MODE" \
+  AGY_ISOLATION="$ISOLATION" AGY_ROLE="$ROLE" AGY_CWD="$CWD" AGY_WORKDIR="$WORKDIR" \
+  AGY_MAX_TURNS="$MAX_TURNS" AGY_COST="$COST_RAW" AGY_TURNS="$TURNS_RAW" \
+  AGY_SESSION="$SESSION_RAW" AGY_STOP="$STOP_RAW" AGY_CHANGED="$CHANGED" \
+  AGY_DIFF="$DIFF_FILE" AGY_REPORT="$TXT_OUT" AGY_BASE="$BASE_COMMIT" \
+  python3 <<'PY'
+import json, os, datetime
+
+def num(v):
+    try:
+        return float(v) if v not in ("", None) else None
+    except ValueError:
+        return None
+
+def integer(v):
+    try:
+        return int(v) if v not in ("", None) else None
+    except ValueError:
+        return None
+
+e = os.environ
+exit_code = int(e["AGY_EXIT"])
+diff_path = e["AGY_DIFF"]
+rec = {
+    "run_id": e["AGY_RUN_ID"],
+    "task_id": e["AGY_TASK_ID"],
+    "ok": exit_code == 0,
+    "exit": exit_code,
+    "reason": e["AGY_REASON"] or None,
+    "route": e["AGY_ROUTE"],
+    "provider": e["AGY_PROVIDER"],
+    "model": e["AGY_MODEL"],
+    "mode": e["AGY_MODE"],
+    "isolation": e["AGY_ISOLATION"],
+    # A shared-isolation diff is the whole tree state, not proof of worker authorship.
+    "diff_scope": "shared" if e["AGY_ISOLATION"] == "shared" else "worktree",
+    "role": e["AGY_ROLE"],
+    "cwd": e["AGY_CWD"],
+    "workdir": e["AGY_WORKDIR"],
+    "base_commit": e["AGY_BASE"] or None,
+    "max_turns": integer(e["AGY_MAX_TURNS"]),
+    "cost_usd": num(e["AGY_COST"]),
+    "turns": integer(e["AGY_TURNS"]),
+    "session_id": e["AGY_SESSION"] or None,
+    "stop_reason": e["AGY_STOP"] or None,
+    "changed_files": [f for f in e["AGY_CHANGED"].split("\n") if f.strip()],
+    "diff_path": diff_path if os.path.exists(diff_path) and os.path.getsize(diff_path) else None,
+    "report_path": e["AGY_REPORT"],
+    "finished_at": datetime.datetime.now().astimezone().isoformat(),
+}
+json.dump(rec, open(e["AGY_RESULT_PATH"], "w"), ensure_ascii=False, indent=2)
+with open(e["AGY_LEDGER"], "a") as fh:
+    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+PY
+  lock_release
+  echo
+  echo "===== AGY_WORKER_RESULT $RUN_DIR/result.json ====="
+}
+
+WORKDIR="$CWD"; WT_DIR=""
+COST_RAW=""; TURNS_RAW=""; SESSION_RAW=""; STOP_RAW=""; CHANGED=""
+
+cleanup() {
+  if [[ -n "$WT_DIR" && "$KEEP_WORKTREE" -eq 0 ]]; then
+    git -C "$CWD" worktree remove --force "$WT_DIR" >/dev/null 2>&1 || true
+    rm -rf "$WT_DIR" >/dev/null 2>&1 || true
+  fi
+  rm -f "$RESV_FILE" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# Reserve the allocated budget under the lock so parallel workers cannot each claim the
+# same remaining balance. The reservation is released when the real cost is recorded.
+BUDGET_STOP="ok"
+if [[ "$PROVIDER" == "claude" ]]; then
+  lock_acquire
+  read -r BUDGET BUDGET_STOP SPENT < <(
+    AGY_RUNS_DIR="$RUNS_DIR" AGY_RESV_DIR="$RESV_DIR" AGY_TASK_ID="$TASK_ID" \
+    AGY_CAP="$AGY_TASK_BUDGET_USD" AGY_CALL="$BUDGET" python3 <<'PY'
+import glob, json, os
+e = os.environ
+task_id, cap, call = e["AGY_TASK_ID"], float(e["AGY_CAP"]), float(e["AGY_CALL"])
+spent = 0.0
+for f in glob.glob(os.path.join(e["AGY_RUNS_DIR"], "*.jsonl")):
     for line in open(f, errors="replace"):
         line = line.strip()
         if not line:
@@ -226,51 +371,42 @@ for f in glob.glob(os.path.join(runs_dir, "*.jsonl")):
         except Exception:
             continue
         if r.get("task_id") == task_id and r.get("cost_usd"):
-            total += float(r["cost_usd"])
-print(f"{total:.6f}")
-PY
-)"
-
-BUDGET_STOP=""
-if [[ "$PROVIDER" == "claude" ]]; then
-  read -r BUDGET BUDGET_STOP < <(python3 - "$SPENT" "$AGY_TASK_BUDGET_USD" "$BUDGET" <<'PY'
-import sys
-spent, cap, call = (float(x) for x in sys.argv[1:4])
+            spent += float(r["cost_usd"])
+for f in glob.glob(os.path.join(e["AGY_RESV_DIR"], "*.json")):
+    try:
+        r = json.load(open(f))
+    except Exception:
+        continue
+    if r.get("task_id") == task_id:
+        spent += float(r.get("reserved_usd") or 0)
 remaining = cap - spent
-if remaining <= 0:
-    print(f"{call:.4f} exhausted")
-else:
-    print(f"{min(call, remaining):.4f} ok")
+print(f"{call:.4f} exhausted {spent:.6f}" if remaining <= 0
+      else f"{min(call, remaining):.4f} ok {spent:.6f}")
 PY
-)
+  )
+  if [[ "$BUDGET_STOP" == "ok" ]]; then
+    printf '{"task_id": "%s", "run_id": "%s", "reserved_usd": %s}\n' \
+      "$TASK_ID" "$RUN_ID" "$BUDGET" > "$RESV_FILE"
+  fi
+  lock_release
+else
+  SPENT="0.000000"
 fi
 
 if [[ "$BUDGET_STOP" == "exhausted" ]]; then
   echo "🛑 task budget exhausted for task-id '$TASK_ID': spent \$$SPENT of \$$AGY_TASK_BUDGET_USD" >&2
   echo "   Raise AGY_TASK_BUDGET_USD in $CONFIG, or start a new --task-id." >&2
+  write_result 3 budget_exhausted
+  echo "===== AGY_WORKER_END exit=3 ====="
   exit 3
 fi
 
-WORKDIR="$CWD"; WT_DIR=""
-cleanup() {
-  if [[ -n "$WT_DIR" && "$KEEP_WORKTREE" -eq 0 ]]; then
-    git -C "$CWD" worktree remove --force "$WT_DIR" >/dev/null 2>&1 || true
-    rm -rf "$WT_DIR" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
-
-if [[ -z "$ISOLATION" ]]; then
-  if git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then ISOLATION=worktree; else ISOLATION=shared; fi
-fi
 if [[ "$ISOLATION" == "worktree" ]]; then
-  git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "worktree isolation requires a Git repository"
+  [[ $IS_GIT -eq 1 ]] || die "worktree isolation requires a Git repository"
   WT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agy-worker.XXXXXX")"
   # Detached worktree so concurrent workers do not contend on a branch.
   git -C "$CWD" worktree add --detach "$WT_DIR" HEAD >/dev/null
   WORKDIR="$WT_DIR"
-elif [[ "$ISOLATION" != "shared" ]]; then
-  die "Invalid --isolation"
 fi
 
 PROMPT=$(cat <<PROMPT_EOF
@@ -294,7 +430,6 @@ Do not delegate to additional agents unless the task explicitly requests it.
 PROMPT_EOF
 )
 
-TXT_OUT="$RUN_DIR/worker.txt"
 RAW_OUT="$RUN_DIR/provider.raw"
 
 echo "========================================================"
@@ -308,13 +443,20 @@ echo "   Run id:     $RUN_ID"
 echo "   Workdir:    $WORKDIR"
 echo "========================================================"
 
+if [[ "$PROVIDER" == "claude" ]] && ! command -v claude >/dev/null 2>&1; then
+  echo "Claude Code CLI 'claude' not found" >&2
+  write_result 127 cli_not_found; echo "===== AGY_WORKER_END exit=127 ====="; exit 127
+fi
+if [[ "$PROVIDER" == "codex" ]] && ! command -v codex >/dev/null 2>&1; then
+  echo "Codex CLI 'codex' not found" >&2
+  write_result 127 cli_not_found; echo "===== AGY_WORKER_END exit=127 ====="; exit 127
+fi
+
 # stdin is closed for the worker CLIs: both 'claude -p' and 'codex exec' otherwise
 # block reading additional input when launched from a non-interactive dispatcher.
 WORKER_EXIT=0
-COST_JSON="null"; TURNS_JSON="null"; SESSION_JSON="null"; STOP_JSON="null"
 set +e
 if [[ "$PROVIDER" == "claude" ]]; then
-  command -v claude >/dev/null 2>&1 || { echo "Claude Code CLI 'claude' not found" >&2; exit 127; }
   (
     cd "$WORKDIR"
     claude -p --model "$MODEL" --max-turns "$MAX_TURNS" --max-budget-usd "$BUDGET" \
@@ -322,25 +464,24 @@ if [[ "$PROVIDER" == "claude" ]]; then
   ) > "$RAW_OUT"
   WORKER_EXIT=$?
   # json output carries the report text plus the cost/turns the budget ledger needs.
-  eval "$(python3 - "$RAW_OUT" "$TXT_OUT" <<'PY'
-import json, shlex, sys
-raw, txt = sys.argv[1], sys.argv[2]
+  eval "$(AGY_RAW="$RAW_OUT" AGY_TXT="$TXT_OUT" python3 <<'PY'
+import json, os, shlex
+raw, txt = os.environ["AGY_RAW"], os.environ["AGY_TXT"]
 try:
     o = json.load(open(raw))
 except Exception:
     open(txt, "w").write(open(raw, errors="replace").read())
-    print("COST_JSON=null TURNS_JSON=null SESSION_JSON=null STOP_JSON=null")
+    print("COST_RAW='' TURNS_RAW='' SESSION_RAW='' STOP_RAW=parse_error")
     raise SystemExit
 open(txt, "w").write(str(o.get("result") or ""))
-def j(v):
-    return "null" if v is None else shlex.quote(json.dumps(v))
-print(f"COST_JSON={j(o.get('total_cost_usd'))} TURNS_JSON={j(o.get('num_turns'))} "
-      f"SESSION_JSON={j(o.get('session_id'))} STOP_JSON={j(o.get('stop_reason') or o.get('subtype'))}")
+def q(v):
+    return shlex.quote("" if v is None else str(v))
+print(f"COST_RAW={q(o.get('total_cost_usd'))} TURNS_RAW={q(o.get('num_turns'))} "
+      f"SESSION_RAW={q(o.get('session_id'))} STOP_RAW={q(o.get('stop_reason') or o.get('subtype'))}")
 PY
 )"
   cat "$TXT_OUT"
 else
-  command -v codex >/dev/null 2>&1 || { echo "Codex CLI 'codex' not found" >&2; exit 127; }
   # workspace-write is deliberately used in isolated worktrees. This avoids current
   # GPT-5.6 read-only tool-provisioning regressions while containing file changes.
   (
@@ -361,17 +502,21 @@ if [[ "$WORKER_EXIT" -ne 0 ]] && grep -q "Reached max turns" "$TXT_OUT" 2>/dev/n
   echo "      Raise CLAUDE_MAX_TURNS_$(echo "$MODE" | tr '[:lower:]' '[:upper:]') in $CONFIG, or split the task." >&2
 fi
 
-DIFF_FILE="$RUN_DIR/worker.diff"
-: > "$DIFF_FILE"
-CHANGED=""
+# Capture the diff through a scratch index. Staging into the caller's real index would
+# silently discard whatever they had staged -- unacceptable for a read-only inspect run.
 if git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  git -C "$WORKDIR" add -A -- . >/dev/null 2>&1 || true
-  git -C "$WORKDIR" diff --cached --no-ext-diff --binary > "$DIFF_FILE" 2>/dev/null || true
-  CHANGED="$(git -C "$WORKDIR" diff --cached --name-only 2>/dev/null || true)"
-  git -C "$WORKDIR" reset >/dev/null 2>&1 || true
+  SCRATCH_INDEX="$RUN_DIR/.scratch-index"
+  if GIT_INDEX_FILE="$SCRATCH_INDEX" git -C "$WORKDIR" read-tree HEAD 2>/dev/null; then
+    GIT_INDEX_FILE="$SCRATCH_INDEX" git -C "$WORKDIR" add -A -- . >/dev/null 2>&1 || true
+    GIT_INDEX_FILE="$SCRATCH_INDEX" git -C "$WORKDIR" diff --cached --no-ext-diff --binary \
+      > "$DIFF_FILE" 2>/dev/null || true
+    CHANGED="$(GIT_INDEX_FILE="$SCRATCH_INDEX" git -C "$WORKDIR" diff --cached --name-only 2>/dev/null || true)"
+  fi
+  rm -f "$SCRATCH_INDEX"
   echo
   echo "===== AGY_WORKER_GIT_DIFF ====="
-  git -C "$WORKDIR" status --short || true
+  [[ "$ISOLATION" == "shared" ]] && \
+    echo "# NOTE: shared isolation -- this diff is the tree state and may include changes the worker did not make."
   cat "$DIFF_FILE"
   echo "===== END_AGY_WORKER_GIT_DIFF ====="
 fi
@@ -379,41 +524,8 @@ fi
 [[ -n "$OUTPUT" ]] && { mkdir -p "$(dirname "$OUTPUT")"; cp "$TXT_OUT" "$OUTPUT"; }
 [[ -n "$WT_DIR" && "$KEEP_WORKTREE" -eq 1 ]] && echo "AGY_WORKTREE=$WT_DIR"
 
-python3 - "$RUN_DIR/result.json" "$LEDGER" <<PY
-import json, os, sys
-res_path, ledger = sys.argv[1], sys.argv[2]
-changed = [f for f in """$CHANGED""".split("\n") if f.strip()]
-rec = {
-    "run_id": "$RUN_ID",
-    "task_id": "$TASK_ID",
-    "ok": $WORKER_EXIT == 0,
-    "exit": $WORKER_EXIT,
-    "route": "$MODEL_KEY",
-    "provider": "$PROVIDER",
-    "model": "$MODEL",
-    "mode": "$MODE",
-    "isolation": "$ISOLATION",
-    "role": """$ROLE""",
-    "cwd": "$CWD",
-    "workdir": "$WORKDIR",
-    "max_turns": $MAX_TURNS,
-    "cost_usd": $COST_JSON,
-    "turns": $TURNS_JSON,
-    "session_id": $SESSION_JSON,
-    "stop_reason": $STOP_JSON,
-    "changed_files": changed,
-    "diff_path": "$DIFF_FILE" if os.path.getsize("$DIFF_FILE") else None,
-    "report_path": "$TXT_OUT",
-    "finished_at": __import__("datetime").datetime.now().astimezone().isoformat(),
-}
-json.dump(rec, open(res_path, "w"), ensure_ascii=False, indent=2)
-with open(ledger, "a") as fh:
-    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-PY
-
 rm -f "$RAW_OUT"
-echo
-echo "===== AGY_WORKER_RESULT $RUN_DIR/result.json ====="
+write_result "$WORKER_EXIT" ""
 # Final sentinel. Always the last line, so a dispatcher knows the report is complete only
 # once it appears. Anything read before it is a partial run.
 echo "===== AGY_WORKER_END exit=$WORKER_EXIT ====="

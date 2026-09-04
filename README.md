@@ -270,8 +270,24 @@ agy-exec apply <run-id> --check    # dry run
 agy-exec apply <run-id>            # three-way merge, staged, never committed
 ```
 
-On conflict it stops and leaves the tree for you to resolve, exiting non-zero. A
-half-applied patch is worse than a refused one.
+`apply` refuses by default when the run failed (`ok: false`), when it was an `inspect`
+run, when it ran with shared isolation (its diff is tree state, not worker output), or
+when the target has uncommitted changes — a dirty target makes a conflict unattributable.
+`--force` overrides each of these.
+
+On conflict it exits non-zero and stops. Note that `git apply --3way` is **not atomic**:
+cleanly merged files stay staged and conflicted ones keep their markers. Resolve them, or
+`git reset --hard` to discard the whole attempt.
+
+### Safety notes
+
+- The worker diff is captured through a scratch index, so a run never touches the index of
+  the directory it was pointed at. An earlier version staged and reset it, which silently
+  discarded whatever the user had staged.
+- `--mode edit` with `--isolation shared` is refused inside a Git repository, since that
+  combination writes straight into the caller's tree. `--allow-shared-edit` overrides.
+- Budget reservations are taken under a lock and released when the real cost is recorded,
+  so parallel workers cannot each claim the same remaining balance.
 
 ---
 

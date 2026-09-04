@@ -265,7 +265,20 @@ agy-exec apply <run-id> --check    # 乾跑檢查
 agy-exec apply <run-id>            # 三方合併，只進 staging，絕不 commit
 ```
 
-衝突時會停下並保留工作區交給你處理，以非零碼結束。半套用的 patch 比拒絕套用更糟。
+`apply` 預設會拒絕：run 失敗（`ok: false`）、run 是 `inspect` 模式、run 使用 shared 隔離
+（其 diff 是工作樹狀態而非 worker 產出），或目標工作樹有未提交變更——髒目標會讓衝突無法歸屬。
+以上都可用 `--force` 覆寫。
+
+衝突時以非零碼結束並停下。請注意 `git apply --3way` **並非原子操作**：乾淨合併的檔案會留在
+staging，衝突檔會留下標記。請自行解決，或用 `git reset --hard` 放棄整次嘗試。
+
+### 安全性註記
+
+- worker diff 透過暫存 index 擷取，因此執行過程絕不會動到目標目錄的 index。舊版會 `git add -A`
+  再 `git reset`，那會靜默抹掉使用者原本 staged 的狀態。
+- 在 Git 專案中 `--mode edit` 搭配 `--isolation shared` 會被程式拒絕，因為那等於直接寫進呼叫端
+  的工作樹。需要時以 `--allow-shared-edit` 覆寫。
+- 預算預留在鎖內取得、於實際成本入帳時釋放，因此並行 worker 不會各自認領同一筆剩餘額度。
 
 ---
 
