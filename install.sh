@@ -12,6 +12,7 @@ MARKER="agy-orchestrator:generated"
 
 mkdir -p "$BIN_DIR" "$AGY_AGENT_DIR" "$AGY_WORKER_DIR" "$AGY_SKILL_DIR" "$CFG_DIR"
 install -m 0755 "$SRC/bin/agy-exec" "$BIN_DIR/agy-exec"
+install -m 0755 "$SRC/bin/agy-audit" "$BIN_DIR/agy-audit"
 install -m 0644 "$SRC/agy/agents/agy-orchestrator/agent.md" "$AGY_AGENT_DIR/agent.md"
 install -m 0644 "$SRC/agy/agents/agy-worker/agent.md" "$AGY_WORKER_DIR/agent.md"
 install -m 0644 "$SRC/agy/skills/model-router/SKILL.md" "$AGY_SKILL_DIR/SKILL.md"
@@ -53,6 +54,7 @@ Installed Agy Orchestrator.
 
 Files:
   $BIN_DIR/agy-exec
+  $BIN_DIR/agy-audit
   $AGY_AGENT_DIR/agent.md
   $AGY_WORKER_DIR/agent.md
   $AGENTS_ROOT/{haiku,sonnet,opus,luna,terra,sol}/agent.md

@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Audit Agy orchestration sessions for contract and routing-ladder violations.
+
+Reads the Antigravity CLI's own trajectory files. Nothing here talks to a model; it is
+pure forensics over what agy already wrote to disk.
+
+    agy-audit                 one-shot report over the last 30 minutes
+    agy-audit --window 3600   ... over the last hour
+    agy-audit --watch         stream one line per NEW event (for a background monitor)
+
+What it looks for, and why each rule exists:
+
+  Worker contract. agy-worker is a cheap dispatch runner whose job is to launch one
+  agy-exec command and relay its output. Its characteristic failure is impatience: it
+  sees RUNNING, decides the command is too slow, does the task itself, and presents its
+  own output as the routed model's report. A fabricated "review passed" reads exactly
+  like a real one, so this flags any command outside the sanctioned set, and any report
+  sent with no completion sentinel anywhere in the run's logs.
+
+  Delegation shape. --isolation shared on an edit task defeats worktree isolation. A
+  TypeName that does not match --model makes the statusline name the wrong model. A
+  dispatch prompt without the sentinel contract invites the impatience failure above.
+
+  Routing ladder. The point of the cost ladder is that a cheap route failing escalates
+  to a stronger one. The quiet way that breaks is the orchestrator absorbing the work
+  itself after a failure -- the ladder never moves and a `pro` main agent does the job a
+  routed model should have. Per-event checks cannot see that; it only shows up when you
+  correlate a failure with what happened next.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+import time
+
+BRAIN = os.path.expanduser("~/.gemini/antigravity-cli/brain")
+SENTINEL = "AGY_WORKER_END"
+
+# agy-exec may be invoked bare or by absolute path, and transcript values are sometimes
+# wrapped in a stray quote layer, so normalise before matching.
+ALLOWED_WORKER_CMD = re.compile(
+    r"^\s*(\S*/)?(agy-exec\b|cat\s+\S*/tasks/task-\S+\.log\s*$|sleep\s+\d+\s*$)"
+)
+
+# Cost ladder tiers. agent.md: retry once at the same tier, then escalate one tier.
+TIER = {"luna": 1, "haiku": 1, "sonnet": 2, "terra": 2, "opus": 3, "sol": 3}
+TIER_NAME = {1: "廉價", 2: "主力", 3: "專家"}
+
+# Cross-family review by an expert route is prescribed policy, not a skipped rung.
+REVIEW_RE = re.compile(r"review|reviewer|審查|複審|審核|審視", re.I)
+
+
+# --------------------------------------------------------------------- parsing ----
+
+def transcript(sid):
+    """Prefer transcript_full.jsonl: transcript.jsonl truncates long tool args, which
+    silently hides TypeName and --isolation from every dispatch check."""
+    base = f"{BRAIN}/{sid}/.system_generated/logs"
+    full, plain = f"{base}/transcript_full.jsonl", f"{base}/transcript.jsonl"
+    try:
+        if os.path.getsize(full) >= os.path.getsize(plain):
+            return full
+    except OSError:
+        pass
+    return plain
+
+
+def load(path):
+    out = []
+    try:
+        for line in open(path, errors="replace"):
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def unq(v):
+    """Transcript args arrive JSON-encoded, sometimes twice. Decode until stable."""
+    for _ in range(3):
+        if not isinstance(v, str):
+            break
+        try:
+            nv = json.loads(v)
+        except Exception:
+            break
+        if nv == v:
+            break
+        v = nv
+    return v
+
+
+def calls(steps):
+    for s in steps:
+        for c in s.get("tool_calls") or []:
+            yield c.get("name", "?"), {k: unq(v) for k, v in (c.get("args") or {}).items()}
+
+
+def norm_cmd(v):
+    """Strip the literal wrapping quote left by double-JSON-encoded CommandLine values."""
+    c = (v or "").strip()
+    while len(c) >= 2 and c[0] == c[-1] and c[0] in "\"'":
+        c = c[1:-1].strip()
+    return c.lstrip("\"'").strip()
+
+
+def dispatches(raw):
+    """Yield (typename, route, prompt) per subagent, falling back to regex when the args
+    were truncated mid-string and no longer parse as JSON."""
+    if isinstance(raw, list) and raw and all(isinstance(x, dict) for x in raw):
+        for sub in raw:
+            pr = sub.get("Prompt") or ""
+            m = re.search(r"--model\s+(\w+)", pr)
+            yield sub.get("TypeName"), (m.group(1) if m else None), pr
+        return
+    s = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+    names = re.findall(r'"TypeName"\s*:\s*"([^"]*)"', s)
+    routes = re.findall(r"--model\s+(\w+)", s)
+    for i in range(max(len(names), len(routes), 1 if s.strip() else 0)):
+        yield (names[i] if i < len(names) else None,
+               routes[i] if i < len(routes) else None,
+               s)
+
+
+def timeline(steps):
+    """Ordered (kind, route, prompt) events: dispatches, self-edits, worker outcomes."""
+    out = []
+    for s in steps:
+        for n, a in calls([s]):
+            if n == "invoke_subagent":
+                for tn, route, pr in dispatches(a.get("Subagents")):
+                    out.append(("dispatch", route or tn, pr or ""))
+            elif n in ("replace_file_content", "write_to_file"):
+                out.append(("edit", None, ""))
+        c = s.get("content") or ""
+        m = re.search(rf"{SENTINEL} exit=(\d+)", c)
+        if m:
+            out.append(("done" if m.group(1) == "0" else "fail", None, ""))
+        elif "Reached max turns" in c:
+            out.append(("fail", None, ""))
+    return out
+
+
+# ---------------------------------------------------------------------- rules ----
+
+def ladder_findings(events):
+    """After a worker fails, did the ladder actually move?"""
+    found = []
+    last_route = None
+    for i, (kind, route, _meta) in enumerate(events):
+        if kind == "dispatch":
+            last_route = route
+            continue
+        if kind != "fail":
+            continue
+        failed, edits, nxt = last_route, 0, None
+        for kind2, route2, _m in events[i + 1:]:
+            if kind2 == "edit":
+                edits += 1
+            elif kind2 == "dispatch":
+                nxt = route2
+                break
+        ft, nt = TIER.get(failed or ""), TIER.get(nxt or "")
+        if nxt is None:
+            if edits >= 2:
+                found.append(("HIGH",
+                    f"梯子斷裂：{failed or '某'} 路由失敗後未再委派，"
+                    f"主控自行編輯 {edits} 次收尾（應同層重試一次或升一層）"))
+            else:
+                found.append(("MED",
+                    f"{failed or '某'} 路由失敗後沒有任何後續委派，升級鏈中斷"))
+        elif ft and nt:
+            if nt > ft:
+                found.append(("OK", f"升級生效：{failed}({TIER_NAME[ft]}) 失敗 → {nxt}({TIER_NAME[nt]})"))
+            elif nt < ft:
+                found.append(("MED", f"反向降級：{failed}({TIER_NAME[ft]}) 失敗後改派更便宜的 {nxt}({TIER_NAME[nt]})"))
+            elif nxt == failed:
+                found.append(("MED", f"同層同路由重試：{failed} 失敗後又派 {nxt}（政策為同層只重試一次）"))
+    return found
+
+
+def expert_without_ladder(events):
+    seen_fail = False
+    out = []
+    for kind, route, meta in events:
+        if kind == "fail":
+            seen_fail = True
+        elif (kind == "dispatch" and TIER.get(route or "") == 3
+              and not seen_fail and not REVIEW_RE.search(meta or "")):
+            out.append(("MED", f"專家模型 {route} 未經階梯直接使用於非審查任務（此前無任何路由失敗）"))
+    return out
+
+
+def dispatch_findings(tn, route, prompt):
+    out = []
+    label = f"TypeName={tn}" + (f" route={route}" if route else "")
+    if "--mode edit" in prompt and "--isolation shared" in prompt:
+        out.append(("HIGH", f"edit 任務傳了 --isolation shared，worktree 隔離失效 → {label}"))
+    if SENTINEL not in prompt:
+        out.append(("MED", f"委派提示詞未含 {SENTINEL} 等待契約 → {label}"))
+    if route and tn and tn != route:
+        out.append(("MED", f"TypeName({tn}) 與 --model({route}) 不一致 → 狀態列會顯示錯的模型"))
+    if tn in ("agy-worker", "self"):
+        out.append(("MED", f"用了通用 TypeName={tn}，狀態列不會顯示路由模型"))
+    return out
+
+
+def task_logs(sid):
+    return glob.glob(f"{BRAIN}/{sid}/.system_generated/tasks/task-*.log")
+
+
+def is_worker(steps, names):
+    first = steps[0].get("content") or ""
+    return "agy-exec" in first and names.count("invoke_subagent") == 0
+
+
+# ------------------------------------------------------------------- one-shot ----
+
+def audit(sid, since):
+    tpath = transcript(sid)
+    try:
+        if os.path.getmtime(tpath) < since:
+            return None
+    except OSError:
+        return None
+    steps = load(tpath)
+    if not steps:
+        return None
+
+    names = [n for n, _ in calls(steps)]
+    n_sub = names.count("invoke_subagent")
+    n_edit = names.count("replace_file_content") + names.count("write_to_file")
+    issues, info = [], []
+
+    if is_worker(steps, names):
+        role = "worker"
+        stray = [norm_cmd(a.get("CommandLine")) for n, a in calls(steps)
+                 if n == "run_command" and not ALLOWED_WORKER_CMD.match(norm_cmd(a.get("CommandLine")))]
+        sent = [a for n, a in calls(steps) if n == "send_message"]
+        big = [f for f in task_logs(sid) if os.path.getsize(f) > 400]
+        done = [f for f in big if SENTINEL in open(f, errors="replace").read()]
+        info.append(f"agy-exec 任務 log {len(big)} 個，其中 {len(done)} 個已出現哨符")
+        if stray:
+            issues.append(("HIGH", "worker 執行非授權指令（代做徵兆）: "
+                                   + "; ".join(c.replace("\n", " ")[:90] for c in stray[:3])))
+        if sent and big and not done:
+            issues.append(("HIGH", "worker 已回報，但沒有任何 agy-exec log 含哨符 → 報告來源可疑"))
+        for f in big:
+            m = re.search(rf"{SENTINEL} exit=(\d+)", open(f, errors="replace").read())
+            if m and m.group(1) != "0":
+                issues.append(("MED", f"worker 以非零離開碼結束 (exit={m.group(1)}): {os.path.basename(f)}"))
+    else:
+        role = "orchestrator"
+        info.append(f"工具呼叫 {len(names)} 次：invoke_subagent={n_sub}, "
+                    f"自行編輯={n_edit}, run_command={names.count('run_command')}")
+        if n_edit >= 3 and n_sub == 0:
+            issues.append(("HIGH", f"自行編輯 {n_edit} 次卻從未委派 → 退化成單模型代理"))
+        elif n_edit > 0 and n_sub == 0:
+            issues.append(("LOW", f"自行編輯 {n_edit} 次，尚無委派（單檔機械式修改則屬正常）"))
+        for n, a in calls(steps):
+            if n == "invoke_subagent":
+                for tn, route, pr in dispatches(a.get("Subagents")):
+                    issues.extend(dispatch_findings(tn, route, pr))
+        ev = timeline(steps)
+        for sev, msg in ladder_findings(ev) + expert_without_ladder(ev):
+            (info.append(msg) if sev == "OK" else issues.append((sev, msg)))
+
+    return dict(sid=sid, role=role, mtime=os.path.getmtime(tpath),
+                steps=len(steps), issues=issues, info=info)
+
+
+def report(window):
+    since = time.time() - window
+    rows = [r for r in (audit(d, since) for d in os.listdir(BRAIN)) if r]
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    if not rows:
+        print(f"（過去 {window // 60} 分鐘內沒有活動中的 agy session）")
+        return 0
+    high = 0
+    for r in rows:
+        ts = time.strftime("%H:%M:%S", time.localtime(r["mtime"]))
+        print(f"\n[{r['role']:>12}] {r['sid'][:8]}  最後活動 {ts}  steps={r['steps']}")
+        for i in r["info"]:
+            print(f"    · {i}")
+        for sev, msg in r["issues"]:
+            icon = {"HIGH": "🔴", "MED": "🟠"}.get(sev, "🟡")
+            print(f"    {icon} [{sev}] {msg}")
+            high += sev == "HIGH"
+        if not r["issues"]:
+            print("    ✅ 無異常")
+    print(f"\n=== 共 {len(rows)} 個 session，HIGH 問題 {high} 項 ===")
+    return 0
+
+
+# ---------------------------------------------------------------------- watch ----
+
+def scan(window):
+    """Yield (dedupe-key, line) for every observable event in the recent window."""
+    since = time.time() - window
+    for sid in os.listdir(BRAIN):
+        tpath = transcript(sid)
+        try:
+            if os.path.getmtime(tpath) < since:
+                continue
+        except OSError:
+            continue
+        steps = load(tpath)
+        if not steps:
+            continue
+        sh = sid[:8]
+        names = [n for n, _ in calls(steps)]
+
+        for i, (n, a) in enumerate(calls(steps)):
+            if n != "invoke_subagent":
+                continue
+            for j, (tn, route, pr) in enumerate(dispatches(a.get("Subagents"))):
+                key = f"{sid}:dispatch:{i}:{j}"
+                label = f"TypeName={tn}" + (f" route={route}" if route else "")
+                yield key, f"🚀 [{sh}] 新委派 → {label}"
+                for k, (sev, msg) in enumerate(dispatch_findings(tn, route, pr)):
+                    yield f"{key}:{k}", f"{'🔴' if sev == 'HIGH' else '🟠'} [{sh}] {sev} {msg}"
+
+        n_edit = names.count("replace_file_content") + names.count("write_to_file")
+        if n_edit >= 6 and names.count("invoke_subagent") == 0:
+            yield (f"{sid}:degrade:{n_edit // 6}",
+                   f"🔴 [{sh}] HIGH 已自行編輯 {n_edit} 次且從未委派 → 退化成單模型代理")
+
+        ev = timeline(steps)
+        for k, (sev, msg) in enumerate(ladder_findings(ev) + expert_without_ladder(ev)):
+            icon = {"HIGH": "🔴", "MED": "🟠"}.get(sev, "🪜")
+            yield f"{sid}:ladder:{k}:{msg[:40]}", f"{icon} [{sh}] {msg}"
+
+        if is_worker(steps, names):
+            for i, (n, a) in enumerate(calls(steps)):
+                if n != "run_command":
+                    continue
+                cmd = norm_cmd(a.get("CommandLine"))
+                if not ALLOWED_WORKER_CMD.match(cmd):
+                    yield (f"{sid}:stray:{i}",
+                           f"🔴 [{sh}] HIGH worker 執行非授權指令（代做徵兆）: "
+                           + cmd.replace("\n", " ")[:110])
+            for f in task_logs(sid):
+                try:
+                    txt = open(f, errors="replace").read()
+                except OSError:
+                    continue
+                m = re.search(rf"{SENTINEL} exit=(\d+)", txt)
+                if not m:
+                    continue
+                base = os.path.basename(f)
+                model = (re.search(r"Model:\s+(\S+)", txt) or [None, "?"])[1]
+                if m.group(1) == "0":
+                    iso = (re.search(r"Isolation:\s+(\S+)", txt) or [None, "?"])[1]
+                    yield (f"{sid}:done:{base}",
+                           f"✅ [{sh}] worker 完成 route={model} isolation={iso} exit=0")
+                else:
+                    yield (f"{sid}:fail:{base}",
+                           f"🟠 [{sh}] MED worker 非零離開碼 exit={m.group(1)} route={model}")
+
+
+def watch(window, interval):
+    seen = {k for k, _ in scan(window)}   # baseline: everything already on disk
+    print(f"👁  agy 監控已啟動（基準線 {len(seen)} 筆既有事件已忽略，只報新事件）", flush=True)
+    while True:
+        try:
+            for key, line in scan(window):
+                if key not in seen:
+                    seen.add(key)
+                    print(line, flush=True)
+        except Exception as e:  # one bad iteration must not kill a session-length watch
+            print(f"⚠️  監控迭代失敗（已續跑）: {type(e).__name__}: {e}", flush=True)
+        time.sleep(interval)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--window", type=int, default=1800,
+                    help="seconds of session activity to consider (default: 1800)")
+    ap.add_argument("--watch", action="store_true",
+                    help="stream one line per new event instead of printing a report")
+    ap.add_argument("--interval", type=int, default=30,
+                    help="seconds between --watch scans (default: 30)")
+    args = ap.parse_args()
+    if not os.path.isdir(BRAIN):
+        print(f"No Agy trajectories found at {BRAIN}", file=sys.stderr)
+        return 1
+    return watch(args.window, args.interval) if args.watch else report(args.window)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

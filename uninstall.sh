@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-rm -f "$HOME/.local/bin/agy-exec"
+rm -f "$HOME/.local/bin/agy-exec" "$HOME/.local/bin/agy-audit"
 rm -rf "$HOME/.gemini/config/agents/agy-orchestrator"
 rm -rf "$HOME/.gemini/config/agents/agy-worker"
 # Route worker agents use ordinary words as names, so remove only what this project

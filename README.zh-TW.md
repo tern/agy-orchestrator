@@ -67,7 +67,8 @@ flowchart TD
 ```text
 agy-orchestrator/
 ├── bin/
-│   └── agy-exec                       # 核心 CLI 橋接執行檔
+│   ├── agy-exec                       # 核心 CLI 橋接執行檔
+│   └── agy-audit                      # 稽核 Agy 自身 trajectory 的鑑識工具
 ├── agy/
 │   ├── agents/
 │   │   ├── agy-orchestrator/
@@ -143,6 +144,43 @@ TypeName 必須與 `agy-exec` 命令中的 `--model` 值一致。`agy-worker` �
 - `--mode edit` 任務還須有 `AGY_WORKER_GIT_DIFF` 區塊。
 
 缺少任何一項，orchestrator 都不得整合、commit，或視為審查通過。
+
+---
+
+## 稽核編排層真正做了什麼
+
+`agy-exec` 記錄每個 worker 做了什麼；`agy-audit` 回答另一半問題：**主控有沒有表現得像個編排者**。
+它讀取 Antigravity CLI 自己寫在 `~/.gemini/antigravity-cli/brain/` 的 trajectory 檔案，
+不與任何模型互動。
+
+```bash
+agy-audit                 # 過去 30 分鐘的報告
+agy-audit --window 3600   # 過去一小時
+agy-audit --watch         # 只輸出「新事件」，每行一筆，供背景監控使用
+```
+
+三類檢查，每一條都是針對真實發生過的失效寫的：
+
+**Worker 契約。** `agy-worker` 是低成本的派發 runner，任務是啟動一條 `agy-exec` 並轉述其輸出。
+它的典型失效是「等不及」：看到 `RUNNING` 就自己把任務做一遍，再把自己的產出當成被路由模型的報告。
+曾經有一筆 commit 就是建立在這樣寫出來的審查上，數分鐘後真報告回來才發現結論相反。因此稽核會標記
+任何授權清單外的指令，以及在 log 沒有完成哨符時就送出的報告。
+
+**委派形狀。** edit 任務傳 `--isolation shared` 會讓 worktree 隔離失效；`TypeName` 與 `--model`
+不一致會讓狀態列顯示錯的模型；委派提示詞缺少哨符契約則等於邀請上述的「等不及」失效。
+
+**路由階梯。** 階梯的意義就在於「便宜路由失敗後升級到更強的」。它最安靜的破法，是主控在失敗後
+自己把工作吞下去——梯子從未往上爬，而 `pro` 主控做了本該由被路由模型做的事。任何單一事件檢查都
+看不到這件事，只有把「失敗」與「接下來發生什麼」關聯起來才會浮現：
+
+```text
+🔴 [06a56e2c] 梯子斷裂：sonnet 路由失敗後未再委派，主控自行編輯 6 次收尾
+🪜 [xxxxxxxx] 升級生效：sonnet(主力) 失敗 → opus(專家)
+🟠 [xxxxxxxx] 同層同路由重試：sonnet 失敗後又派 sonnet
+```
+
+以專家路由擔任審查者的情況，豁免於「未經階梯直接使用專家模型」這條規則——跨家族審查是
+`agent.md` 明訂的政策，不是跳過階梯。
 
 ---
 

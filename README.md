@@ -67,7 +67,8 @@ flowchart TD
 ```text
 agy-orchestrator/
 ├── bin/
-│   └── agy-exec                       # Core CLI execution bridge
+│   ├── agy-exec                       # Core CLI execution bridge
+│   └── agy-audit                      # Forensics over Agy's own trajectory files
 ├── agy/
 │   ├── agents/
 │   │   ├── agy-orchestrator/
@@ -145,6 +146,49 @@ A worker report is only valid when it carries:
 - an `AGY_WORKER_GIT_DIFF` block, for `--mode edit` tasks.
 
 The orchestrator must not integrate, commit, or treat a review as passed without them.
+
+---
+
+## Auditing what the orchestration actually did
+
+`agy-exec` records what each worker did. `agy-audit` answers the other half: did the
+*orchestrator* behave like an orchestrator? It reads the Antigravity CLI's own trajectory
+files under `~/.gemini/antigravity-cli/brain/` and talks to no model.
+
+```bash
+agy-audit                 # report on the last 30 minutes
+agy-audit --window 3600   # ... the last hour
+agy-audit --watch         # stream one line per NEW event, for a background monitor
+```
+
+Three families of check, each written against a failure that actually happened here:
+
+**Worker contract.** `agy-worker` is a cheap dispatch runner meant to launch one
+`agy-exec` command and relay its output. Its characteristic failure is impatience: it
+sees `RUNNING`, decides the command is too slow, does the task itself, and presents its
+own output as the routed model's report. Once, a commit landed on a review that was
+written that way and only contradicted minutes later by the real one. So the audit flags
+any command outside the sanctioned set, and any report sent with no completion sentinel
+in the run's logs.
+
+**Delegation shape.** `--isolation shared` on an edit task defeats worktree isolation. A
+`TypeName` that does not match `--model` makes the statusline name the wrong model. A
+dispatch prompt missing the sentinel contract invites the impatience failure above.
+
+**Routing ladder.** The ladder's whole point is that a cheap route failing escalates to a
+stronger one. The quiet way it breaks is the orchestrator absorbing the work itself after
+a failure — the ladder never moves, and a `pro` main agent does the job a routed model
+should have. No per-event check can see this; it only appears when you correlate a
+failure with what happened next:
+
+```text
+🔴 [06a56e2c] 梯子斷裂：sonnet 路由失敗後未再委派，主控自行編輯 6 次收尾
+🪜 [xxxxxxxx] 升級生效：sonnet(主力) 失敗 → opus(專家)
+🟠 [xxxxxxxx] 同層同路由重試：sonnet 失敗後又派 sonnet
+```
+
+Expert routes used as reviewers are exempt from the "expert without a failed cheaper
+attempt" rule, since cross-family review is prescribed policy rather than a skipped rung.
 
 ---
 
