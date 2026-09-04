@@ -39,11 +39,15 @@ invoke_subagent({
       "TypeName": "agy-worker",
       "Role": "Claude Sonnet (主力實作)",
       "Model": "flash_lite",
-      "Prompt": "執行以下命令：\nagy-exec --model sonnet --mode edit --role implementation --task \"Objective: implement token refresh. Scope: src/auth and tests/auth. Constraints: preserve public API. Verification: run targeted auth tests.\""
+      "Prompt": "請使用 run_command 執行以下這一條命令，不要執行其他任何命令：\nagy-exec --model sonnet --mode edit --role implementation --task \"Objective: implement token refresh. Scope: src/auth and tests/auth. Constraints: preserve public API. Verification: run targeted auth tests.\"\n\n這條命令會跑數分鐘，第一次 status 一定是 RUNNING，那是正常的。請持續以 manage_task 輪詢，直到 log 最後一行出現 ===== AGY_WORKER_END exit=... ===== 為止，再把完整 log 原文回傳給 orchestrator。在哨符出現前不得回報結果，不得自行執行任務，不得用自己的觀察補寫報告。"
     }
   ]
 })
 ```
+
+Do not pass `--isolation shared` for `--mode edit`. Omit `--isolation` so `agy-exec`
+creates a detached worktree; reserve `shared` for inspect-only tasks that must see the
+live working tree, or for non-Git directories.
 
 Every delegated task prompt to `agy-exec` must state:
 - Objective
@@ -52,6 +56,21 @@ Every delegated task prompt to `agy-exec` must state:
 - Whether modification is allowed (`--mode inspect` or `--mode edit`)
 - Expected output
 - Verification method
+
+## Worker report validity
+
+`agy-worker` is a `flash_lite` dispatch runner. Its strongest failure mode is impatience:
+it sees `RUNNING`, decides the command is too slow, does the task itself with its own
+`run_command`, and sends that back as if the routed model had produced it. A fabricated
+"review passed" reads exactly like a real one.
+
+A worker report counts as real only when it contains:
+- `===== AGY_WORKER_END exit=0 =====` (always the final line of a completed run);
+- the `🚀 [agy-worker] Starting:` banner naming the model you actually routed to;
+- an `AGY_WORKER_GIT_DIFF` block, for edit tasks.
+
+Anything else is an incomplete delegation. Re-dispatch or request the full task log.
+Never integrate, commit, or mark a review as passed on an unsentineled report.
 
 ## Parallelism
 
@@ -73,6 +92,7 @@ If Sonnet authored important code, prefer Terra or Sol for independent review. I
 ## Completion gate
 
 Before reporting success, confirm:
+- every worker report you relied on carried the `AGY_WORKER_END` sentinel;
 - intended change exists;
 - relevant tests/build/checks ran where feasible;
 - no unexplained new diff remains;

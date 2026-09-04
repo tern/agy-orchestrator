@@ -99,6 +99,32 @@ When `agy-orchestrator` delegates tasks, it invokes the `agy-worker` subagent vi
 
 ---
 
+## Worker Report Contract
+
+`agy-exec` runs for minutes. The `agy-worker` subagent that dispatches it is a cheap
+`flash_lite` runner, so its natural failure mode is impatience: seeing `RUNNING`, doing
+the task itself, and relaying its own output as if the routed model had produced it. A
+fabricated "review passed" is indistinguishable from a real one until the real report
+arrives minutes later and contradicts it.
+
+Every completed run therefore ends with a sentinel as its final line:
+
+```text
+===== AGY_WORKER_END exit=0 =====
+```
+
+`agy-exec` also exits with the worker's own exit code, so a failed worker fails the
+bridge instead of silently reporting success.
+
+A worker report is only valid when it carries:
+- `===== AGY_WORKER_END exit=0 =====`;
+- the `🚀 [agy-worker] Starting:` banner naming the routed model;
+- an `AGY_WORKER_GIT_DIFF` block, for `--mode edit` tasks.
+
+The orchestrator must not integrate, commit, or treat a review as passed without them.
+
+---
+
 ## Prerequisites & Installation
 
 ### Requirements

@@ -137,22 +137,29 @@ echo "   Isolation:  $ISOLATION"
 echo "   Workdir:    $WORKDIR"
 echo "========================================================"
 
+# stdin is closed for the worker CLIs: both 'claude -p' and 'codex exec' otherwise
+# block reading additional input when launched from a non-interactive dispatcher.
+WORKER_EXIT=0
+set +e
 if [[ "$PROVIDER" == "claude" ]]; then
   command -v claude >/dev/null 2>&1 || { echo "Claude Code CLI 'claude' not found" >&2; exit 127; }
   (
     cd "$WORKDIR"
     claude -p --model "$MODEL" --max-turns "$CLAUDE_MAX_TURNS" --max-budget-usd "$BUDGET" \
-      --permission-mode acceptEdits --output-format text "$PROMPT"
+      --permission-mode acceptEdits --output-format text "$PROMPT" < /dev/null
   ) | tee "$TMP_OUT"
+  WORKER_EXIT=${PIPESTATUS[0]}
 else
   command -v codex >/dev/null 2>&1 || { echo "Codex CLI 'codex' not found" >&2; exit 127; }
   # workspace-write is deliberately used in isolated worktrees. This avoids current
   # GPT-5.6 read-only tool-provisioning regressions while containing file changes.
   (
     cd "$WORKDIR"
-    codex exec --ephemeral -m "$MODEL" --sandbox workspace-write -C "$WORKDIR" "$PROMPT"
+    codex exec --ephemeral -m "$MODEL" --sandbox workspace-write -C "$WORKDIR" "$PROMPT" < /dev/null
   ) | tee "$TMP_OUT"
+  WORKER_EXIT=${PIPESTATUS[0]}
 fi
+set -e
 
 echo
 echo "========================================================"
@@ -176,3 +183,9 @@ if [[ -n "$WT_DIR" && "$KEEP_WORKTREE" -eq 1 ]]; then
   echo "AGY_WORKTREE=$WT_DIR"
 fi
 rm -f "$TMP_OUT"
+
+# Final sentinel. It is always the last line of output, so a dispatcher can poll the
+# log and know the report is complete only once this line appears. Anything read
+# before it is a partial run and must not be reported as a worker result.
+echo "===== AGY_WORKER_END exit=$WORKER_EXIT ====="
+exit "$WORKER_EXIT"

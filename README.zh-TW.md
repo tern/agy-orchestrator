@@ -99,6 +99,31 @@ agy-orchestrator/
 
 ---
 
+## Worker 回報契約 (Report Contract)
+
+`agy-exec` 動輒執行數分鐘，而負責派發它的 `agy-worker` 是低成本的 `flash_lite` runner，
+天然的失效模式就是「等不及」：看到 `RUNNING` 就自己把任務做一遍，再把自己的產出當成
+被路由模型的報告回傳。偽造的「審查通過」跟真的長得一模一樣——直到數分鐘後真報告回來
+並且結論相反。
+
+因此每次完整執行的最後一行必定是哨符：
+
+```text
+===== AGY_WORKER_END exit=0 =====
+```
+
+`agy-exec` 同時會以 worker 自身的離開碼結束，失敗的 worker 會讓橋接層一起失敗，不再
+靜默回報成功。
+
+一份 worker 報告唯有同時具備以下三者才算有效：
+- `===== AGY_WORKER_END exit=0 =====`；
+- 標明所路由模型的 `🚀 [agy-worker] Starting:` 橫幅；
+- `--mode edit` 任務還須有 `AGY_WORKER_GIT_DIFF` 區塊。
+
+缺少任何一項，orchestrator 都不得整合、commit，或視為審查通過。
+
+---
+
 ## 安裝需求與步驟
 
 ### 系統需求
