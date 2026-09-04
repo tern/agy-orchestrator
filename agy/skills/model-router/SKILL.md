@@ -28,22 +28,30 @@ Choose the cheapest model that is likely to succeed.
 4. Default maximum concurrent external workers: 4.
 5. If a cheap worker succeeds and verification passes, stop escalating.
 
-## Delegation format
+## Delegation format & Bottom Statusline
 
-Every delegated task must state:
+To render live worker status in Agy's bottom statusline, dispatch tasks using `invoke_subagent` with TypeName `"agy-worker"` (or `"self"`):
+
+```json
+invoke_subagent({
+  "Subagents": [
+    {
+      "TypeName": "agy-worker",
+      "Role": "Claude Sonnet (主力實作)",
+      "Model": "flash_lite",
+      "Prompt": "執行以下命令：\nagy-exec --model sonnet --mode edit --role implementation --task \"Objective: implement token refresh. Scope: src/auth and tests/auth. Constraints: preserve public API. Verification: run targeted auth tests.\""
+    }
+  ]
+})
+```
+
+Every delegated task prompt to `agy-exec` must state:
 - Objective
 - Relevant files/directories if known
 - Constraints
 - Whether modification is allowed (`--mode inspect` or `--mode edit`)
 - Expected output
 - Verification method
-
-Example:
-
-```bash
-agy-exec --model sonnet --mode edit --role implementation \
-  --task "Objective: implement token refresh. Scope: src/auth and tests/auth. Constraints: preserve public API. Verification: run targeted auth tests."
-```
 
 ## Parallelism
 

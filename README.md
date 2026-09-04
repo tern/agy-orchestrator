@@ -70,8 +70,10 @@ agy-orchestrator/
 │   └── agy-exec                       # Core CLI execution bridge
 ├── agy/
 │   ├── agents/
-│   │   └── agy-orchestrator/
-│   │       └── agent.md               # Main orchestrator agent definition
+│   │   ├── agy-orchestrator/
+│   │   │   └── agent.md               # Main orchestrator agent definition
+│   │   └── agy-worker/
+│   │       └── agent.md               # Dedicated worker subagent for StatusLine integration
 │   └── skills/
 │       └── model-router/
 │           └── SKILL.md               # Model routing skill definition
@@ -85,6 +87,15 @@ agy-orchestrator/
 ├── README.zh-TW.md                    # Traditional Chinese documentation
 └── .gitignore                         # Git ignore patterns
 ```
+
+---
+
+## Real-Time Subagent Statusline
+
+When `agy-orchestrator` delegates tasks, it invokes the `agy-worker` subagent via `invoke_subagent`:
+- **Real-Time Display**: An interactive worker status entry pops up directly in the Agy CLI bottom bar (e.g. `● Claude Sonnet (主力實作) [running]` or `● GPT-5.6 Luna (輕量探索) [running]`).
+- **Progress & Metrics**: Displays the active worker model, elapsed running time, and active tool calls.
+- **Concurrent Tracking**: When multiple workers run simultaneously, all active subagents are shown side by side in the statusline.
 
 ---
 
