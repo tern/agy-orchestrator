@@ -282,7 +282,14 @@ def audit(sid, since):
         role = "worker"
         stray = [norm_cmd(a.get("CommandLine")) for n, a in calls(steps)
                  if n == "run_command" and not ALLOWED_WORKER_CMD.match(norm_cmd(a.get("CommandLine")))]
-        sent = [a for n, a in calls(steps) if n == "send_message"]
+        # A worker may report through send_message or by simply ending its turn with the
+        # report as its final response. Both are "it told the orchestrator something", and
+        # keying the fabrication check on send_message alone let the second form through.
+        sent = ([a for n, a in calls(steps) if n == "send_message"]
+                or [s for s in steps[-3:]
+                    if s.get("type") == "PLANNER_RESPONSE"
+                    and not s.get("tool_calls")
+                    and len(s.get("content") or "") > 200])
         big = [f for f in task_logs(sid) if os.path.getsize(f) > 400]
         done = [f for f in big if SENTINEL in open(f, errors="replace").read()]
         info.append(f"agy-exec 任務 log {len(big)} 個，其中 {len(done)} 個已出現哨符")
