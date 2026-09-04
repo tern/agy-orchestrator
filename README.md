@@ -232,6 +232,29 @@ Edit your configuration anytime in:
 
 When providers rename models, simply update the IDs in this file. No changes to scripts or agent definitions are required.
 
+### Turn budgets
+
+Claude workers get a turn budget tiered by `--mode`, because the two modes do different
+amounts of work: an inspect worker reads and reports, while an edit worker also changes
+files, runs clippy/tests and reacts to the results. One shared cap starves the edit path.
+
+```ini
+CLAUDE_MAX_TURNS_INSPECT=20
+CLAUDE_MAX_TURNS_EDIT=60
+```
+
+A worker that runs out ends with `Error: Reached max turns (N)` and
+`===== AGY_WORKER_END exit=1 =====`, and `agy-exec` prints which variable to raise. If it
+keeps happening on edit tasks, either raise `CLAUDE_MAX_TURNS_EDIT` or split the task into
+smaller delegations. The banner shows the applied budget on every Claude run:
+
+```text
+   Mode:       edit
+   Max turns:  60 (mode=edit)
+```
+
+The older single `CLAUDE_MAX_TURNS` is ignored; `agy-exec` warns if it is still set.
+
 ---
 
 ## Codex Sandbox Note

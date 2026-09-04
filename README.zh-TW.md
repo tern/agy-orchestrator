@@ -233,6 +233,29 @@ agy-exec --model <haiku|sonnet|opus|luna|terra|sol> --task <text> [options]
 
 例如當服務商發布新模型時，僅需修改此處的 ID（如 `CLAUDE_SONNET_MODEL` 或 `OPENAI_TERRA_MODEL`），無須更動任何腳本或 Agent 設定。
 
+### 回合預算 (Turn Budget)
+
+Claude worker 的回合上限**依 `--mode` 分級**，因為兩種模式的工作量本質不同：inspect 只需
+閱讀與回報，edit 還要改檔、跑 clippy/測試並根據結果反應。共用單一上限會讓 edit 路徑在做完
+之前就被截斷。
+
+```ini
+CLAUDE_MAX_TURNS_INSPECT=20
+CLAUDE_MAX_TURNS_EDIT=60
+```
+
+用盡回合的 worker 會以 `Error: Reached max turns (N)` 收場，並輸出
+`===== AGY_WORKER_END exit=1 =====`；`agy-exec` 會提示該調高哪一個變數。若 edit 任務反覆
+撞到上限，就調高 `CLAUDE_MAX_TURNS_EDIT`，或把任務拆成更小的委派。每次 Claude 執行的橫幅
+都會顯示實際套用的預算：
+
+```text
+   Mode:       edit
+   Max turns:  60 (mode=edit)
+```
+
+舊的單一 `CLAUDE_MAX_TURNS` 已不再使用；若仍留在設定檔中，`agy-exec` 會提示忽略。
+
 ---
 
 ## 卸載

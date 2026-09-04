@@ -64,7 +64,15 @@ fi
 : "${CLAUDE_BUDGET_CHEAP:=0.50}"
 : "${CLAUDE_BUDGET_PRIMARY:=2.00}"
 : "${CLAUDE_BUDGET_EXPERT:=5.00}"
-: "${CLAUDE_MAX_TURNS:=20}"
+
+# Turn budgets are tiered by mode: an inspect worker reads and reports, while an edit
+# worker also has to change files, run clippy/tests and react to what they say. A single
+# shared cap starves the edit path long before the work is done.
+: "${CLAUDE_MAX_TURNS_INSPECT:=20}"
+: "${CLAUDE_MAX_TURNS_EDIT:=60}"
+if [[ -n "${CLAUDE_MAX_TURNS:-}" ]]; then
+  echo "note: CLAUDE_MAX_TURNS is legacy and ignored; set CLAUDE_MAX_TURNS_INSPECT / CLAUDE_MAX_TURNS_EDIT in $CONFIG" >&2
+fi
 
 case "$MODEL_KEY" in
   haiku)  PROVIDER=claude; MODEL="$CLAUDE_HAIKU_MODEL"; BUDGET="$CLAUDE_BUDGET_CHEAP" ;;
@@ -102,8 +110,10 @@ fi
 
 if [[ "$MODE" == "inspect" ]]; then
   ACTION_RULE="READ-ONLY TASK. Do not modify, create, delete, rename, commit, or format files. Inspect and report only."
+  MAX_TURNS="$CLAUDE_MAX_TURNS_INSPECT"
 else
   ACTION_RULE="EDIT TASK. You may edit files required for the task. Do not commit. Keep changes tightly scoped and run the smallest relevant verification."
+  MAX_TURNS="$CLAUDE_MAX_TURNS_EDIT"
 fi
 
 PROMPT=$(cat <<PROMPT_EOF
@@ -134,6 +144,7 @@ echo "🚀 [agy-worker] Starting: $ROLE"
 echo "   Model:      $MODEL_KEY ($MODEL) via $PROVIDER"
 echo "   Mode:       $MODE"
 echo "   Isolation:  $ISOLATION"
+[[ "$PROVIDER" == "claude" ]] && echo "   Max turns:  $MAX_TURNS (mode=$MODE)"
 echo "   Workdir:    $WORKDIR"
 echo "========================================================"
 
@@ -145,7 +156,7 @@ if [[ "$PROVIDER" == "claude" ]]; then
   command -v claude >/dev/null 2>&1 || { echo "Claude Code CLI 'claude' not found" >&2; exit 127; }
   (
     cd "$WORKDIR"
-    claude -p --model "$MODEL" --max-turns "$CLAUDE_MAX_TURNS" --max-budget-usd "$BUDGET" \
+    claude -p --model "$MODEL" --max-turns "$MAX_TURNS" --max-budget-usd "$BUDGET" \
       --permission-mode acceptEdits --output-format text "$PROMPT" < /dev/null
   ) | tee "$TMP_OUT"
   WORKER_EXIT=${PIPESTATUS[0]}
@@ -165,6 +176,11 @@ echo
 echo "========================================================"
 echo "✅ [agy-worker] Finished: $ROLE ($MODEL_KEY)"
 echo "========================================================"
+
+if [[ "$WORKER_EXIT" -ne 0 ]] && grep -q "Reached max turns" "$TMP_OUT" 2>/dev/null; then
+  echo "hint: worker hit the ${MAX_TURNS}-turn cap for mode=$MODE." >&2
+  echo "      Raise CLAUDE_MAX_TURNS_$(echo "$MODE" | tr '[:lower:]' '[:upper:]') in $CONFIG, or split the task." >&2
+fi
 
 if git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo
