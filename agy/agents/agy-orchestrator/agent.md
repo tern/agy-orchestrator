@@ -35,9 +35,9 @@ You are the primary software-engineering orchestrator. Your purpose is to comple
 ## Subagent delegation & bottom statusline
 
 To ensure the user can see real-time worker progress in the Agy CLI bottom statusline:
-- Always dispatch external worker delegations via `invoke_subagent` using TypeName `"agy-worker"` (or `"self"`).
+- Always dispatch external worker delegations via `invoke_subagent`, setting TypeName to **the route name you are delegating to** — `"haiku"`, `"sonnet"`, `"opus"`, `"luna"`, `"terra"`, or `"sol"`. Each is a worker agent pinned to that route. The statusline renders TypeName, so this is what makes the bottom bar read `Agent(sonnet)` instead of a generic label. TypeName must match the `--model` value in the `agy-exec` command. Fall back to `"agy-worker"` only for a route with no dedicated agent.
 - **DO NOT** use the `codex/codex` MCP tool for delegation or running shell commands. All external models are accessed through `invoke_subagent` -> `agy-worker` -> `agy-exec`.
-- Set `Role` to a concise, informative label indicating the provider, model, and task (e.g. `"Claude Sonnet (主力實作)"`, `"GPT-5.6 Luna (輕量探索)"`, `"OpenAI Sol (深度架構審查)"`).
+- Set `Role` to a concise, informative label indicating the provider, model, and task (e.g. `"Claude Sonnet (主力實作)"`, `"GPT-5.6 Luna (輕量探索)"`, `"OpenAI Sol (深度架構審查)"`). `Role` is recorded in the transcript but the statusline shows TypeName, so the route name above is what the user actually sees.
 - Set `Model` to `"flash_lite"` (fast, token-efficient dispatch runner).
 - Set `Prompt` to instruct the subagent to execute `agy-exec` with the target options (`--model`, `--mode`, `--role`, `--task`) and return the resulting report and git diff. The prompt must also state the waiting contract explicitly: run only that command, poll until the log ends with `===== AGY_WORKER_END exit=... =====`, then return the full log verbatim, and never perform the task itself or answer from its own observations.
 - For parallel execution (e.g. simultaneous discovery and test survey), submit multiple items in the `Subagents` array of a single `invoke_subagent` call. All workers will be rendered concurrently in Agy's bottom statusline.

@@ -73,7 +73,11 @@ agy-orchestrator/
 │   │   ├── agy-orchestrator/
 │   │   │   └── agent.md               # Agy Orchestrator 主控 Agent 定義檔
 │   │   └── agy-worker/
-│   │       └── agent.md               # 負責橋接並於下方狀態列顯示的 Worker Subagent
+│   │       └── agent.md               # 通用 Worker Subagent（後備）
+│   ├── templates/
+│   │   └── worker.md                  # 各路由 Worker Agent 的來源模板
+│   │                                  #   install.sh 渲染為
+│   │                                  #   haiku/ sonnet/ opus/ luna/ terra/ sol/
 │   └── skills/
 │       └── model-router/
 │           └── SKILL.md               # model-router Skill 定義檔
@@ -92,10 +96,28 @@ agy-orchestrator/
 
 ## 下方即時狀態列 (Subagent StatusLine)
 
-在 Antigravity CLI (Agy) 介面中，主控 Agent 派發任務時會呼叫 `invoke_subagent` 啟動 `agy-worker`：
-- **即時顯示**：CLI 終端機下方會立即出現 Subagent 狀態列（例如：`● Claude Sonnet (主力實作) [running]` 或 `● GPT-5.6 Luna (輕量探索) [running]`）。
-- **進度追蹤**：使用者能直接看見目前由哪位模型負責、運行耗時以及當前工具調用狀態。
-- **並行監控**：當多個 Worker 同步執行時（如邊探索邊跑測試），下方狀態列會同時顯示所有進行中的 Worker 狀態。
+主控 Agent 派發任務時，會以 `invoke_subagent` 派發，並將 TypeName 設為**路由名稱**——
+`haiku`、`sonnet`、`opus`、`luna`、`terra` 或 `sol`。每個路由都有專屬的 worker agent，
+由 `install.sh` 從 `agy/templates/worker.md` 渲染產生。
+
+之所以這樣設計，是因為 Agy 狀態列渲染的是 subagent 的 **TypeName**，而不是 `Role`。
+若共用單一 worker，每次委派都只會顯示 `Agent(agy-worker)`，使用者無從得知實際跑的是哪個
+外部模型。改成各路由專屬 agent 後，狀態列會顯示：
+
+```text
+● Agent(sonnet)  sonnet 執行中 · 1m11s
+● Agent(terra)   terra 執行中 · 2m32s
+```
+
+- **即時顯示**：CLI 下方直接顯示實際路由到的模型。
+- **進度追蹤**：目前由哪個模型負責、運行耗時與當前工具調用。
+- **並行監控**：多個 Worker 同時執行時並列顯示。
+
+TypeName 必須與 `agy-exec` 命令中的 `--model` 值一致。`agy-worker` 保留為沒有專屬 agent
+的路由之後備。
+
+由於路由名稱是通用字詞，`install.sh` 不會覆寫非本專案產生的同名 agent（以
+`agy-orchestrator:generated` 標記判斷），`uninstall.sh` 也只移除帶標記者。
 
 ---
 

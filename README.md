@@ -73,7 +73,11 @@ agy-orchestrator/
 │   │   ├── agy-orchestrator/
 │   │   │   └── agent.md               # Main orchestrator agent definition
 │   │   └── agy-worker/
-│   │       └── agent.md               # Dedicated worker subagent for StatusLine integration
+│   │       └── agent.md               # Generic worker subagent (fallback)
+│   ├── templates/
+│   │   └── worker.md                  # Source for the per-route worker agents
+│   │                                  #   install.sh renders it into
+│   │                                  #   haiku/ sonnet/ opus/ luna/ terra/ sol/
 │   └── skills/
 │       └── model-router/
 │           └── SKILL.md               # Model routing skill definition
@@ -92,10 +96,29 @@ agy-orchestrator/
 
 ## Real-Time Subagent Statusline
 
-When `agy-orchestrator` delegates tasks, it invokes the `agy-worker` subagent via `invoke_subagent`:
-- **Real-Time Display**: An interactive worker status entry pops up directly in the Agy CLI bottom bar (e.g. `● Claude Sonnet (主力實作) [running]` or `● GPT-5.6 Luna (輕量探索) [running]`).
-- **Progress & Metrics**: Displays the active worker model, elapsed running time, and active tool calls.
-- **Concurrent Tracking**: When multiple workers run simultaneously, all active subagents are shown side by side in the statusline.
+When `agy-orchestrator` delegates, it dispatches via `invoke_subagent` with TypeName set to
+the **route name** — `haiku`, `sonnet`, `opus`, `luna`, `terra`, or `sol`. Each route has its
+own worker agent, rendered by `install.sh` from `agy/templates/worker.md`.
+
+This exists because the Agy statusline renders the subagent's **TypeName**, not its `Role`.
+A single shared worker would show every delegation as `Agent(agy-worker)`, leaving the user
+unable to tell which external model is running. Per-route agents make it read:
+
+```text
+● Agent(sonnet)  sonnet 執行中 · 1m11s
+● Agent(terra)   terra 執行中 · 2m32s
+```
+
+- **Real-Time Display**: the routed model appears directly in the Agy CLI bottom bar.
+- **Progress & Metrics**: active model, elapsed running time, and current tool call.
+- **Concurrent Tracking**: parallel workers are shown side by side.
+
+TypeName must match the `--model` value in the `agy-exec` command. `agy-worker` remains as a
+fallback for routes without a dedicated agent.
+
+Because route names are ordinary words, `install.sh` never overwrites an agent it did not
+generate (it looks for an `agy-orchestrator:generated` marker), and `uninstall.sh` removes
+only marked ones.
 
 ---
 

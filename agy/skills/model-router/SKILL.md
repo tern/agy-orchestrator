@@ -30,13 +30,16 @@ Choose the cheapest model that is likely to succeed.
 
 ## Delegation format & Bottom Statusline
 
-To render live worker status in Agy's bottom statusline, dispatch tasks using `invoke_subagent` with TypeName `"agy-worker"` (or `"self"`):
+Dispatch with `invoke_subagent`, setting **TypeName to the route name** (`haiku`, `sonnet`,
+`opus`, `luna`, `terra`, `sol`). Each route has its own worker agent, and Agy's bottom
+statusline renders TypeName — so this is what makes it read `Agent(sonnet)` rather than a
+generic label. TypeName must match `--model` in the command:
 
 ```json
 invoke_subagent({
   "Subagents": [
     {
-      "TypeName": "agy-worker",
+      "TypeName": "sonnet",
       "Role": "Claude Sonnet (主力實作)",
       "Model": "flash_lite",
       "Prompt": "請使用 run_command 執行以下這一條命令，不要執行其他任何命令：\nagy-exec --model sonnet --mode edit --role implementation --task \"Objective: implement token refresh. Scope: src/auth and tests/auth. Constraints: preserve public API. Verification: run targeted auth tests.\"\n\n這條命令會跑數分鐘，第一次 status 一定是 RUNNING，那是正常的。請持續以 manage_task 輪詢，直到 log 最後一行出現 ===== AGY_WORKER_END exit=... ===== 為止，再把完整 log 原文回傳給 orchestrator。在哨符出現前不得回報結果，不得自行執行任務，不得用自己的觀察補寫報告。"
@@ -66,6 +69,7 @@ it sees `RUNNING`, decides the command is too slow, does the task itself with it
 
 A worker report counts as real only when it contains:
 - `===== AGY_WORKER_END exit=0 =====` (always the final line of a completed run);
+- a TypeName matching the `--model` route you dispatched;
 - the `🚀 [agy-worker] Starting:` banner naming the model you actually routed to;
 - an `AGY_WORKER_GIT_DIFF` block, for edit tasks.
 
