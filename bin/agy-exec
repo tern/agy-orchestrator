@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+agy-exec --model <haiku|sonnet|opus|luna|terra|sol> --task <text> [options]
+
+Options:
+  --cwd <path>                 Repository/project directory (default: pwd)
+  --role <text>                Worker role label
+  --mode <inspect|edit>        inspect = do not change files; edit = may change files
+  --isolation <worktree|shared> Default: worktree for Git repos, otherwise shared
+  --output <path>              Save worker text to a file
+  --keep-worktree              Keep temporary worktree for inspection
+  -h, --help
+
+Examples:
+  agy-exec --model haiku --mode inspect --task "Find auth entry points"
+  agy-exec --model sonnet --mode edit --task "Implement the approved auth change"
+  agy-exec --model sol --mode inspect --task "Review this architecture for race conditions"
+USAGE
+}
+
+MODEL_KEY=""
+TASK=""
+CWD="$(pwd)"
+ROLE="worker"
+MODE="inspect"
+ISOLATION=""
+OUTPUT=""
+KEEP_WORKTREE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model) MODEL_KEY="$2"; shift 2 ;;
+    --task) TASK="$2"; shift 2 ;;
+    --cwd) CWD="$2"; shift 2 ;;
+    --role) ROLE="$2"; shift 2 ;;
+    --mode) MODE="$2"; shift 2 ;;
+    --isolation) ISOLATION="$2"; shift 2 ;;
+    --output) OUTPUT="$2"; shift 2 ;;
+    --keep-worktree) KEEP_WORKTREE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[[ -n "$MODEL_KEY" && -n "$TASK" ]] || { usage >&2; exit 2; }
+[[ "$MODE" == "inspect" || "$MODE" == "edit" ]] || { echo "Invalid --mode" >&2; exit 2; }
+CWD="$(cd "$CWD" && pwd)"
+
+CONFIG="${AGY_ORCH_MODELS_FILE:-$HOME/.config/agy-orchestrator/models.env}"
+if [[ -f "$CONFIG" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+fi
+
+: "${CLAUDE_HAIKU_MODEL:=claude-haiku-4-5}"
+: "${CLAUDE_SONNET_MODEL:=claude-sonnet-5}"
+: "${CLAUDE_OPUS_MODEL:=claude-opus-5}"
+: "${OPENAI_LUNA_MODEL:=gpt-5.6-luna}"
+: "${OPENAI_TERRA_MODEL:=gpt-5.6-terra}"
+: "${OPENAI_SOL_MODEL:=gpt-5.6-sol}"
+: "${CLAUDE_BUDGET_CHEAP:=0.50}"
+: "${CLAUDE_BUDGET_PRIMARY:=2.00}"
+: "${CLAUDE_BUDGET_EXPERT:=5.00}"
+: "${CLAUDE_MAX_TURNS:=20}"
+
+case "$MODEL_KEY" in
+  haiku)  PROVIDER=claude; MODEL="$CLAUDE_HAIKU_MODEL"; BUDGET="$CLAUDE_BUDGET_CHEAP" ;;
+  sonnet) PROVIDER=claude; MODEL="$CLAUDE_SONNET_MODEL"; BUDGET="$CLAUDE_BUDGET_PRIMARY" ;;
+  opus)   PROVIDER=claude; MODEL="$CLAUDE_OPUS_MODEL"; BUDGET="$CLAUDE_BUDGET_EXPERT" ;;
+  luna)   PROVIDER=codex;  MODEL="$OPENAI_LUNA_MODEL" ;;
+  terra)  PROVIDER=codex;  MODEL="$OPENAI_TERRA_MODEL" ;;
+  sol)    PROVIDER=codex;  MODEL="$OPENAI_SOL_MODEL" ;;
+  *) echo "Unknown model key: $MODEL_KEY" >&2; exit 2 ;;
+esac
+
+if [[ -z "$ISOLATION" ]]; then
+  if git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then ISOLATION=worktree; else ISOLATION=shared; fi
+fi
+
+WORKDIR="$CWD"
+WT_DIR=""
+cleanup() {
+  if [[ -n "$WT_DIR" && "$KEEP_WORKTREE" -eq 0 ]]; then
+    git -C "$CWD" worktree remove --force "$WT_DIR" >/dev/null 2>&1 || true
+    rm -rf "$WT_DIR" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+if [[ "$ISOLATION" == "worktree" ]]; then
+  git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "worktree isolation requires a Git repository" >&2; exit 2; }
+  WT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agy-worker.XXXXXX")"
+  # Use detached worktree so concurrent workers do not contend on a branch.
+  git -C "$CWD" worktree add --detach "$WT_DIR" HEAD >/dev/null
+  WORKDIR="$WT_DIR"
+elif [[ "$ISOLATION" != "shared" ]]; then
+  echo "Invalid --isolation" >&2; exit 2
+fi
+
+if [[ "$MODE" == "inspect" ]]; then
+  ACTION_RULE="READ-ONLY TASK. Do not modify, create, delete, rename, commit, or format files. Inspect and report only."
+else
+  ACTION_RULE="EDIT TASK. You may edit files required for the task. Do not commit. Keep changes tightly scoped and run the smallest relevant verification."
+fi
+
+PROMPT=$(cat <<PROMPT_EOF
+You are a delegated software-engineering worker called by an orchestration agent.
+Role: $ROLE
+Model route: $MODEL_KEY
+Working directory: $WORKDIR
+
+$ACTION_RULE
+
+Task:
+$TASK
+
+Return a concise structured report with:
+1. Outcome
+2. Files inspected/changed
+3. Verification performed and result
+4. Risks or unresolved issues
+5. Recommended next action for the orchestrator
+Do not delegate to additional agents unless the task explicitly requests it.
+PROMPT_EOF
+)
+
+TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/agy-output.XXXXXX")"
+
+if [[ "$PROVIDER" == "claude" ]]; then
+  command -v claude >/dev/null 2>&1 || { echo "Claude Code CLI 'claude' not found" >&2; exit 127; }
+  (
+    cd "$WORKDIR"
+    claude -p --model "$MODEL" --max-turns "$CLAUDE_MAX_TURNS" --max-budget-usd "$BUDGET" \
+      --permission-mode acceptEdits --output-format text "$PROMPT"
+  ) | tee "$TMP_OUT"
+else
+  command -v codex >/dev/null 2>&1 || { echo "Codex CLI 'codex' not found" >&2; exit 127; }
+  # workspace-write is deliberately used in isolated worktrees. This avoids current
+  # GPT-5.6 read-only tool-provisioning regressions while containing file changes.
+  (
+    cd "$WORKDIR"
+    codex exec --ephemeral -m "$MODEL" --sandbox workspace-write -C "$WORKDIR" "$PROMPT"
+  ) | tee "$TMP_OUT"
+fi
+
+if git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo
+  echo "===== AGY_WORKER_GIT_DIFF ====="
+  git -C "$WORKDIR" status --short || true
+  git -C "$WORKDIR" diff --no-ext-diff --binary || true
+  echo "===== END_AGY_WORKER_GIT_DIFF ====="
+fi
+
+if [[ -n "$OUTPUT" ]]; then
+  mkdir -p "$(dirname "$OUTPUT")"
+  cp "$TMP_OUT" "$OUTPUT"
+fi
+
+if [[ -n "$WT_DIR" && "$KEEP_WORKTREE" -eq 1 ]]; then
+  echo "AGY_WORKTREE=$WT_DIR"
+fi
+rm -f "$TMP_OUT"

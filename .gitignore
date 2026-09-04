@@ -1,0 +1,20 @@
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor & IDE directories
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary & output files
+*.tmp
+*.log
+tmp/
+out/
+
+# Local custom configuration overrides
+*.local.env

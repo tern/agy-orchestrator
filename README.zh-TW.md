@@ -1,0 +1,181 @@
+# Agy Orchestrator
+
+[English](README.md) | [繁體中文](README.zh-TW.md)
+
+**Agy Orchestrator** 是一個專為 Google Antigravity (Agy) 設計的**跨模型、注重成本效益 (Cost-Aware) 的軟體工程編排層**。
+
+它讓 Agy 保持為主控 Agent (Main Agent)，負責規劃任務拆解、工作流協調與最後的程式碼整合，並透過 `agy-exec` 橋接器將特定的軟體工程子任務分派給 **Anthropic Claude Code** 或 **OpenAI Codex** 的不同模型。
+
+---
+
+## 為什麼需要 Agy Orchestrator？
+
+1. **突破單一供應商限制**：Agy 內建的 subagent 主要提供層級（如 `inherit`、`flash`、`pro`）。透過本專案的 `model-router` skill 與 `agy-exec` 橋接器，Agy 可以靈活調度 Claude (Haiku / Sonnet / Opus) 與 OpenAI (Luna / Terra / Sol)。
+2. **極致成本效益 (Cost-Aware Routing)**：大任務不需要全程使用昂貴的旗艦模型。初期的程式碼搜尋、調查由低成本模型進行，主力開發交給中階模型，唯有遇到疑難架構或卡關時才升級至專家模型。
+3. **工作區安全隔離 (Git Worktree Isolation)**：所有外派 worker 預設在獨立的暫存 Git Worktree 中執行，不會直接污染或修改你主要工作區的檔案。Agy 僅檢視 worker 產生的 diff 與驗證報告，以提案方式審核合併。
+4. **跨模型家族交叉審查 (Cross-Family Review)**：Claude 撰寫的程式碼可交由 OpenAI 模型審查，反之亦然，有效消除單一模型盲點。
+
+---
+
+## 系統架構
+
+```mermaid
+flowchart TD
+    User([使用者 User]) <--> Agy[Agy Main Agent<br/>Google Antigravity]
+    
+    subgraph Agy Orchestrator
+        Agy --> Router[model-router Skill]
+        Router --> Exec[agy-exec CLI Bridge]
+    end
+    
+    subgraph Provider Workers
+        Exec -->|claude -p| ClaudeWorkers["Claude Code CLI<br/>(Haiku 4.5 / Sonnet 5 / Opus 5)"]
+        Exec -->|codex exec| CodexWorkers["OpenAI Codex CLI<br/>(Luna / Terra / Sol 5.6)"]
+    end
+    
+    subgraph Isolation Layer
+        ClaudeWorkers -.-> Worktree[Git Worktree<br/>(獨立臨時工作目錄)]
+        CodexWorkers -.-> Worktree
+    end
+    
+    Worktree -->|Git Diff / Report| Exec
+    Exec -->|回傳報告與 Diff| Agy
+```
+
+---
+
+## 模型階梯與路由策略 (Routing Ladder)
+
+| 任務類型 | 首選模型 | 備選模型 | 升級 / 專家模型 |
+|---|---|---|---|
+| 程式碼搜尋、Grep 計畫、文件、樣板、簡易測試 | **Luna** (GPT-5.6) | **Haiku** (Claude 4.5) | Terra |
+| 快速程式碼探索、初步分類、單元檢查 | **Haiku** (Claude 4.5) | **Luna** (GPT-5.6) | Sonnet |
+| 主力功能實作、重構、一般 Bug 排除 | **Sonnet** (Claude 5) | **Terra** (GPT-5.6) | Opus / Sol |
+| OpenAI 體系主力實作、雙向交叉審查 | **Terra** (GPT-5.6) | **Sonnet** (Claude 5) | Sol |
+| 複雜架構設計、模糊規格、困難問題排查 | **Opus** (Claude 5) | **Sol** (GPT-5.6) | 交叉雙審查 |
+| 深度邏輯推理、跨檔案系統性審查與驗證 | **Sol** (GPT-5.6) | **Opus** (Claude 5) | 交叉雙審查 |
+
+---
+
+## 專案結構
+
+```text
+agy-orchestrator/
+├── bin/
+│   └── agy-exec                       # 核心 CLI 橋接執行檔
+├── agy/
+│   ├── agents/
+│   │   └── agy-orchestrator/
+│   │       └── agent.md               # Agy Orchestrator 專用 Agent 定義檔
+│   └── skills/
+│       └── model-router/
+│           └── SKILL.md               # model-router Skill 定義檔
+├── config/
+│   └── models.env                     # 模型別名與預算映射設定檔範本
+├── examples/
+│   └── task-prompts.md                # 各情境範例 Prompt
+├── install.sh                         # 一鍵安裝腳本
+├── uninstall.sh                       # 移除腳本
+├── README.md                          # 英文說明文件
+├── README.zh-TW.md                    # 繁體中文說明文件
+└── .gitignore                         # Git 忽略清單
+```
+
+---
+
+## 安裝需求與步驟
+
+### 系統需求
+- **Google Antigravity (Agy) CLI**
+- **Claude Code CLI** (`claude`) 且已完成登入認證
+- **OpenAI Codex CLI** (`codex`) 且已完成登入認證
+- 建議在 **Git** 版本控制專案目錄下使用
+
+### 一鍵安裝
+```bash
+git clone https://github.com/<your-username>/agy-orchestrator.git
+cd agy-orchestrator
+./install.sh
+```
+
+### PATH 設定
+確認 `~/.local/bin` 已加入系統 PATH（若使用 zsh，請加入 `~/.zshrc`）：
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+安裝腳本會將以下檔案部署至系統：
+1. `~/.local/bin/agy-exec`（核心執行檔）
+2. `~/.gemini/config/agents/agy-orchestrator/agent.md`（Agent 定義）
+3. `~/.gemini/config/skills/model-router/SKILL.md`（Skill 定義）
+4. `~/.config/agy-orchestrator/models.env`（模型配置檔）
+
+---
+
+## 快速測試 (Smoke Test)
+
+安裝完成後，可直接透過命令列測試橋接是否正常運作：
+
+```bash
+# 測試 Claude Haiku (inspect 唯讀模式)
+agy-exec --model haiku --mode inspect --task "請說明你是哪個模型路由，並不要修改任何檔案。"
+
+# 測試 OpenAI Luna (inspect 唯讀模式)
+agy-exec --model luna --mode inspect --task "請高層次瀏覽此專案結構並概述其核心功能。"
+```
+
+---
+
+## CLI 指令說明 (`agy-exec`)
+
+```text
+agy-exec --model <haiku|sonnet|opus|luna|terra|sol> --task <text> [options]
+
+選項：
+  --model <name>               指定使用的模型別名 (haiku|sonnet|opus|luna|terra|sol)
+  --task <text>                交給 worker 執行的任務內容
+  --cwd <path>                 工作目錄 (預設為當前目錄 pwd)
+  --role <text>                Worker 角色標籤 (如 implementation, reviewer)
+  --mode <inspect|edit>        inspect: 唯讀模式 / edit: 允許編輯檔案
+  --isolation <worktree|shared> 隔離模式 (Git 專案預設為 worktree，非 Git 專案降級為 shared)
+  --output <path>              將 worker 輸出報告儲存至特定檔案
+  --keep-worktree              執行結束後保留臨時 worktree (便於手動檢查)
+  -h, --help                   顯示說明資訊
+```
+
+---
+
+## 在 Antigravity (Agy) 中使用
+
+1. 重啟 Antigravity CLI 或 IDE。
+2. 執行 `/agents` 並切換至 **`agy-orchestrator`**。
+3. 開始對話，建議 prompt 範例：
+
+```text
+請使用 orchestrator 路由策略協助我完成這項變更。
+以成本意識為原則：使用 Luna/Haiku 進行輕量探索與測試分析，由 Sonnet/Terra 進行主要功能實作與除錯；
+僅在低階模型遭遇瓶頸或確有高難度架構決策時才升級至 Opus/Sol。重要變更需進行跨模型審查，並在主工作區確認驗證結果。
+```
+
+更多使用範例請參考 [`examples/task-prompts.md`](examples/task-prompts.md)。
+
+---
+
+## 自訂模型映射 (`models.env`)
+
+如需調整各別名實際對應的模型名稱或預算上限，請修改：
+```text
+~/.config/agy-orchestrator/models.env
+```
+
+例如當服務商發布新模型時，僅需修改此處的 ID（如 `CLAUDE_SONNET_MODEL` 或 `OPENAI_TERRA_MODEL`），無須更動任何腳本或 Agent 設定。
+
+---
+
+## 卸載
+
+若需移除，請執行：
+```bash
+./uninstall.sh
+```
+*備註：卸載時會保留 `~/.config/agy-orchestrator/models.env`，避免你自訂的模型設定遺失。*
