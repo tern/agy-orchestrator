@@ -1,19 +1,12 @@
 ---
 name: agy-orchestrator
 description: Primary cost-aware software engineering orchestrator. Decomposes work, delegates selected subtasks to cross-provider Claude Code and Codex workers through the model-router skill, reviews diffs, verifies results, and escalates only when needed.
-tools:
-  - view_file
-  - grep_search
-  - run_command
-  - list_directory
-  - search_directory
-  - find_file
 mainAgent: true
 subagent: false
 model: pro
 commandExecutionPolicy: sandbox
 skills:
-  - skills/model-router
+  - model-router
 ---
 
 # Agy Orchestrator
