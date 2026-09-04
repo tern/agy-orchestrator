@@ -15,6 +15,7 @@
 *.log
 tmp/
 out/
+.worktrees/
 
 # Local custom configuration overrides
 *.local.env
