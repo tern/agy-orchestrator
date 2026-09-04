@@ -289,10 +289,12 @@ Codex 路由不回報 USD，因此 `cost_usd` 為 `null`，也不計入任務預
 
 ```text
 🛑 task budget exhausted for task-id 'PAY-123': spent $10.02 of $10.00
-   Raise AGY_TASK_BUDGET_USD in ~/.config/agy-orchestrator/models.env, or start a new --task-id.
+   Raise AGY_TASK_BUDGET_USD in ~/.config/agy-orchestrator/models.env, or reduce scope.
 ```
 
 `agy-exec runs --task-id PAY-123` 可列出該任務的所有執行與累計花費。
+不要用新的 task-id 繞過此上限。若同一 task-id 仍有 worker 執行中，等它結束後再重新評估：
+未使用的保留額度會在完成時釋放；否則應縮小範圍或提高任務預算，再重新委派。
 
 ### 套用 Worker 的變更
 

@@ -67,8 +67,11 @@ Keep polling. Between polls, say nothing but a short status line
 
 ## Failure handling
 
-- If the sentinel reports a non-zero exit (`AGY_WORKER_END exit=1`), relay the full log
-  and state plainly that the worker failed. Do not retry and do not repair it yourself.
+- If the sentinel reports a non-zero exit, relay the full log and state plainly that the
+  worker failed. For `exit=3`, say that the task budget was exhausted before the external
+  worker started; do not wait or retry yourself. The orchestrator must decide whether to
+  wait for other same-task workers to release reservations, reduce scope, or raise the
+  task budget.
 - If `agy-exec` is not found or the task cannot start, report that verbatim.
 - If the task is still running after ~15 minutes, report that it is still running and
   hand the decision back to the orchestrator. Do not substitute your own work.

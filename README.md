@@ -299,10 +299,13 @@ and exits `3` once the budget is gone:
 
 ```text
 🛑 task budget exhausted for task-id 'PAY-123': spent $10.02 of $10.00
-   Raise AGY_TASK_BUDGET_USD in ~/.config/agy-orchestrator/models.env, or start a new --task-id.
+   Raise AGY_TASK_BUDGET_USD in ~/.config/agy-orchestrator/models.env, or reduce scope.
 ```
 
 `agy-exec runs --task-id PAY-123` lists the runs and the spend so far.
+Do not start a new task-id to bypass this cap. If another worker with the same task-id is
+still running, wait for it to finish and reassess: its unused reservation is released at
+completion. Otherwise, reduce the scope or raise the task budget before re-dispatching.
 
 ### Applying worker changes
 

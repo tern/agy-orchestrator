@@ -105,6 +105,12 @@ task-id against `AGY_TASK_BUDGET_USD`; each call is clamped to the remaining bal
 `agy-exec` exits 3 when the budget is gone. Escalating through five routes under one
 task-id therefore costs at most the task budget, not five per-call budgets.
 
+If `result.json` reports `reason: budget_exhausted` and `exit: 3`, the provider never
+started. Keep the same task-id: wait only when another worker for it is still running,
+then reassess after its reservation is released. Otherwise stop and ask the user to reduce
+scope or raise `AGY_TASK_BUDGET_USD`; do not re-dispatch or create a new task-id merely to
+bypass the cap.
+
 Integrate edit work with `agy-exec apply <run-id>` (add `--check` to dry-run). It
 three-way merges the preserved diff and stops on conflict.
 

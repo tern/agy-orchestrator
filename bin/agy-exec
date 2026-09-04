@@ -395,7 +395,7 @@ fi
 
 if [[ "$BUDGET_STOP" == "exhausted" ]]; then
   echo "🛑 task budget exhausted for task-id '$TASK_ID': spent \$$SPENT of \$$AGY_TASK_BUDGET_USD" >&2
-  echo "   Raise AGY_TASK_BUDGET_USD in $CONFIG, or start a new --task-id." >&2
+  echo "   Raise AGY_TASK_BUDGET_USD in $CONFIG, or reduce scope before retrying." >&2
   write_result 3 budget_exhausted
   echo "===== AGY_WORKER_END exit=3 ====="
   exit 3
