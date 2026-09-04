@@ -21,25 +21,30 @@
 
 ```mermaid
 flowchart TD
-    User([使用者 User]) <--> Agy[Agy Main Agent<br/>Google Antigravity]
-    
-    subgraph Agy Orchestrator
-        Agy --> Router[model-router Skill]
-        Router --> Exec[agy-exec CLI Bridge]
+    User(["使用者 (User)"]) <--> AgyNode["Agy 主控 Agent<br/>(Google Antigravity)"]
+
+    subgraph Sub_Orchestrator ["Agy Orchestrator"]
+        Router["model-router Skill"]
+        Exec["agy-exec CLI Bridge"]
+        AgyNode --> Router
+        Router --> Exec
     end
-    
-    subgraph Provider Workers
-        Exec -->|claude -p| ClaudeWorkers["Claude Code CLI<br/>(Haiku 4.5 / Sonnet 5 / Opus 5)"]
-        Exec -->|codex exec| CodexWorkers["OpenAI Codex CLI<br/>(Luna / Terra / Sol 5.6)"]
+
+    subgraph Sub_Providers ["Provider Workers"]
+        ClaudeWorkers["Claude Code CLI<br/>(Haiku 4.5 / Sonnet 5 / Opus 5)"]
+        CodexWorkers["OpenAI Codex CLI<br/>(Luna / Terra / Sol 5.6)"]
+        Exec -->|"claude -p"| ClaudeWorkers
+        Exec -->|"codex exec"| CodexWorkers
     end
-    
-    subgraph Isolation Layer
-        ClaudeWorkers -.-> Worktree[Git Worktree<br/>(獨立臨時工作目錄)]
+
+    subgraph Sub_Isolation ["隔離層 (Isolation Layer)"]
+        Worktree["Git Worktree<br/>(獨立臨時工作目錄)"]
+        ClaudeWorkers -.-> Worktree
         CodexWorkers -.-> Worktree
     end
-    
-    Worktree -->|Git Diff / Report| Exec
-    Exec -->|回傳報告與 Diff| Agy
+
+    Worktree -->|"Git Diff / 報告"| Exec
+    Exec -->|"回傳報告與 Diff"| AgyNode
 ```
 
 ---
