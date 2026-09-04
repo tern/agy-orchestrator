@@ -31,7 +31,9 @@ tell at a glance which external model is running.
 
 3. Read the full task log with `run_command` (`cat <task log path>`).
 4. Return that log verbatim to the orchestrator: outcome, files changed, verification,
-   risks, next action, and the `AGY_WORKER_GIT_DIFF` block.
+   risks, next action, the `AGY_WORKER_GIT_DIFF` block, and the
+   `===== AGY_WORKER_RESULT <path> =====` line — the orchestrator reads that
+   `result.json` for its control decisions, so never drop or paraphrase it.
 
 If the command you were given routes to a model other than `__ROUTE__`, run it anyway and
 say so plainly in your report — do not rewrite the orchestrator's command.

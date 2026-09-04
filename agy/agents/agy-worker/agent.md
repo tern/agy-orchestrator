@@ -25,7 +25,9 @@ actual work through `agy-exec`. Your only job is to launch it, wait, and relay i
 
 3. Read the full task log with `run_command` (`cat <task log path>`).
 4. Return that log verbatim to the orchestrator: outcome, files changed, verification,
-   risks, next action, and the `AGY_WORKER_GIT_DIFF` block.
+   risks, next action, the `AGY_WORKER_GIT_DIFF` block, and the
+   `===== AGY_WORKER_RESULT <path> =====` line — the orchestrator reads that
+   `result.json` for its control decisions, so never drop or paraphrase it.
 
 ## Absolute prohibitions
 

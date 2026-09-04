@@ -1,34 +1,165 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+STATE_DIR="${AGY_ORCH_STATE_DIR:-$HOME/.local/share/agy-orchestrator}"
+RUNS_DIR="$STATE_DIR/runs"
+CONFIG="${AGY_ORCH_MODELS_FILE:-$HOME/.config/agy-orchestrator/models.env}"
+
 usage() {
   cat <<'USAGE'
 agy-exec --model <haiku|sonnet|opus|luna|terra|sol> --task <text> [options]
+agy-exec apply <run-id> [--cwd <path>] [--check] [-- <file>...]
+agy-exec runs [--task-id <id>] [--limit <n>]
 
-Options:
+Delegate options:
   --cwd <path>                 Repository/project directory (default: pwd)
   --role <text>                Worker role label
   --mode <inspect|edit>        inspect = do not change files; edit = may change files
   --isolation <worktree|shared> Default: worktree for Git repos, otherwise shared
+  --task-id <id>               Budget/ledger grouping key for one unit of work.
+                               Default: <repo-basename>-<YYYYMMDD>
   --output <path>              Save worker text to a file
   --keep-worktree              Keep temporary worktree for inspection
   -h, --help
 
+Every delegate run records $STATE_DIR/runs/<run-id>/{result.json,worker.diff,worker.txt}
+and appends one line to $STATE_DIR/runs/<date>.jsonl. Read result.json for control
+decisions (did it finish, what changed, what did it cost); read the report text for
+content. The last stdout line is always the completion sentinel.
+
 Examples:
   agy-exec --model haiku --mode inspect --task "Find auth entry points"
-  agy-exec --model sonnet --mode edit --task "Implement the approved auth change"
-  agy-exec --model sol --mode inspect --task "Review this architecture for race conditions"
+  agy-exec --model sonnet --mode edit --task-id PAY-123 --task "Implement token refresh"
+  agy-exec apply 20260904-171500-sonnet-a1b2 --check
 USAGE
 }
 
-MODEL_KEY=""
-TASK=""
-CWD="$(pwd)"
-ROLE="worker"
-MODE="inspect"
-ISOLATION=""
-OUTPUT=""
-KEEP_WORKTREE=0
+die() { echo "$*" >&2; exit 2; }
+
+load_config() {
+  if [[ -f "$CONFIG" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG"
+  fi
+  : "${CLAUDE_HAIKU_MODEL:=claude-haiku-4-5}"
+  : "${CLAUDE_SONNET_MODEL:=claude-sonnet-5}"
+  : "${CLAUDE_OPUS_MODEL:=claude-opus-5}"
+  : "${OPENAI_LUNA_MODEL:=gpt-5.6-luna}"
+  : "${OPENAI_TERRA_MODEL:=gpt-5.6-terra}"
+  : "${OPENAI_SOL_MODEL:=gpt-5.6-sol}"
+  : "${CLAUDE_BUDGET_CHEAP:=0.50}"
+  : "${CLAUDE_BUDGET_PRIMARY:=2.00}"
+  : "${CLAUDE_BUDGET_EXPERT:=5.00}"
+  : "${AGY_TASK_BUDGET_USD:=10.00}"
+  : "${CLAUDE_MAX_TURNS_INSPECT:=20}"
+  : "${CLAUDE_MAX_TURNS_EDIT:=60}"
+}
+
+# ---------------------------------------------------------------- apply ------
+
+cmd_apply() {
+  local run_id="" target="" check=0 files=()
+  [[ $# -gt 0 ]] || die "apply requires a run id"
+  run_id="$1"; shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cwd) target="$2"; shift 2 ;;
+      --check) check=1; shift ;;
+      --) shift; files=("$@"); break ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown apply argument: $1" ;;
+    esac
+  done
+
+  local dir="$RUNS_DIR/$run_id"
+  [[ -d "$dir" ]] || die "No such run: $run_id (looked in $RUNS_DIR)"
+  local diff="$dir/worker.diff"
+  [[ -s "$diff" ]] || die "Run $run_id has no changes to apply"
+
+  if [[ -z "$target" ]]; then
+    target="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cwd"])' "$dir/result.json")"
+  fi
+  target="$(cd "$target" && pwd)"
+  git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "apply target is not a Git repository: $target"
+
+  # A worker diff is a proposal. Three-way merge it and stop on conflict rather than
+  # forcing it in: a half-applied patch is worse than a refused one.
+  local args=(-C "$target" apply --3way)
+  [[ ${#files[@]} -gt 0 ]] && args+=(--include="${files[0]}")
+  for f in "${files[@]:1}"; do args+=(--include="$f"); done
+
+  if [[ "$check" -eq 1 ]]; then
+    if git "${args[@]}" --check "$diff" 2>&1; then
+      echo "✅ clean: run $run_id applies to $target"
+      return 0
+    fi
+    echo "⚠️  run $run_id does not apply cleanly to $target" >&2
+    return 1
+  fi
+
+  if git "${args[@]}" "$diff"; then
+    # --3way needs the index, so the result lands staged. Never committed.
+    echo "✅ applied run $run_id to $target (staged, not committed)"
+    git -C "$target" status --short
+  else
+    echo "⚠️  conflict applying run $run_id; working tree left for you to resolve" >&2
+    return 1
+  fi
+}
+
+# ----------------------------------------------------------------- runs ------
+
+cmd_runs() {
+  local task_id="" limit=20
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --task-id) task_id="$2"; shift 2 ;;
+      --limit) limit="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown runs argument: $1" ;;
+    esac
+  done
+  python3 - "$RUNS_DIR" "$task_id" "$limit" <<'PY'
+import glob, json, os, sys
+runs_dir, task_id, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+rows = []
+for f in sorted(glob.glob(os.path.join(runs_dir, "*.jsonl"))):
+    for line in open(f, errors="replace"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            pass
+if task_id:
+    rows = [r for r in rows if r.get("task_id") == task_id]
+rows = rows[-limit:]
+if not rows:
+    print("(no runs recorded)")
+    raise SystemExit
+total = sum(r.get("cost_usd") or 0 for r in rows)
+print(f"{'run id':<34} {'route':<7} {'mode':<8} {'exit':>4} {'cost':>8}  task-id")
+for r in rows:
+    cost = r.get("cost_usd")
+    print(f"{r.get('run_id',''):<34} {r.get('route',''):<7} {r.get('mode',''):<8} "
+          f"{r.get('exit',''):>4} {('$%.4f' % cost) if cost is not None else '       -':>8}  "
+          f"{r.get('task_id','')}")
+print(f"\n{len(rows)} runs, known cost ${total:.4f}")
+PY
+}
+
+# ------------------------------------------------------------- delegate ------
+
+case "${1:-}" in
+  apply) shift; load_config; cmd_apply "$@"; exit ;;
+  runs)  shift; load_config; cmd_runs "$@"; exit ;;
+  -h|--help) usage; exit 0 ;;
+esac
+
+MODEL_KEY=""; TASK=""; CWD="$(pwd)"; ROLE="worker"; MODE="inspect"
+ISOLATION=""; OUTPUT=""; KEEP_WORKTREE=0; TASK_ID=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,6 +169,7 @@ while [[ $# -gt 0 ]]; do
     --role) ROLE="$2"; shift 2 ;;
     --mode) MODE="$2"; shift 2 ;;
     --isolation) ISOLATION="$2"; shift 2 ;;
+    --task-id) TASK_ID="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
     --keep-worktree) KEEP_WORKTREE=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -46,50 +178,80 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$MODEL_KEY" && -n "$TASK" ]] || { usage >&2; exit 2; }
-[[ "$MODE" == "inspect" || "$MODE" == "edit" ]] || { echo "Invalid --mode" >&2; exit 2; }
+[[ "$MODE" == "inspect" || "$MODE" == "edit" ]] || die "Invalid --mode"
 CWD="$(cd "$CWD" && pwd)"
-
-CONFIG="${AGY_ORCH_MODELS_FILE:-$HOME/.config/agy-orchestrator/models.env}"
-if [[ -f "$CONFIG" ]]; then
-  # shellcheck disable=SC1090
-  source "$CONFIG"
-fi
-
-: "${CLAUDE_HAIKU_MODEL:=claude-haiku-4-5}"
-: "${CLAUDE_SONNET_MODEL:=claude-sonnet-5}"
-: "${CLAUDE_OPUS_MODEL:=claude-opus-5}"
-: "${OPENAI_LUNA_MODEL:=gpt-5.6-luna}"
-: "${OPENAI_TERRA_MODEL:=gpt-5.6-terra}"
-: "${OPENAI_SOL_MODEL:=gpt-5.6-sol}"
-: "${CLAUDE_BUDGET_CHEAP:=0.50}"
-: "${CLAUDE_BUDGET_PRIMARY:=2.00}"
-: "${CLAUDE_BUDGET_EXPERT:=5.00}"
-
-# Turn budgets are tiered by mode: an inspect worker reads and reports, while an edit
-# worker also has to change files, run clippy/tests and react to what they say. A single
-# shared cap starves the edit path long before the work is done.
-: "${CLAUDE_MAX_TURNS_INSPECT:=20}"
-: "${CLAUDE_MAX_TURNS_EDIT:=60}"
-if [[ -n "${CLAUDE_MAX_TURNS:-}" ]]; then
+load_config
+[[ -n "${CLAUDE_MAX_TURNS:-}" ]] && \
   echo "note: CLAUDE_MAX_TURNS is legacy and ignored; set CLAUDE_MAX_TURNS_INSPECT / CLAUDE_MAX_TURNS_EDIT in $CONFIG" >&2
-fi
+
+: "${TASK_ID:=$(basename "$CWD")-$(date +%Y%m%d)}"
 
 case "$MODEL_KEY" in
   haiku)  PROVIDER=claude; MODEL="$CLAUDE_HAIKU_MODEL"; BUDGET="$CLAUDE_BUDGET_CHEAP" ;;
   sonnet) PROVIDER=claude; MODEL="$CLAUDE_SONNET_MODEL"; BUDGET="$CLAUDE_BUDGET_PRIMARY" ;;
   opus)   PROVIDER=claude; MODEL="$CLAUDE_OPUS_MODEL"; BUDGET="$CLAUDE_BUDGET_EXPERT" ;;
-  luna)   PROVIDER=codex;  MODEL="$OPENAI_LUNA_MODEL" ;;
-  terra)  PROVIDER=codex;  MODEL="$OPENAI_TERRA_MODEL" ;;
-  sol)    PROVIDER=codex;  MODEL="$OPENAI_SOL_MODEL" ;;
-  *) echo "Unknown model key: $MODEL_KEY" >&2; exit 2 ;;
+  luna)   PROVIDER=codex;  MODEL="$OPENAI_LUNA_MODEL"; BUDGET="" ;;
+  terra)  PROVIDER=codex;  MODEL="$OPENAI_TERRA_MODEL"; BUDGET="" ;;
+  sol)    PROVIDER=codex;  MODEL="$OPENAI_SOL_MODEL"; BUDGET="" ;;
+  *) die "Unknown model key: $MODEL_KEY" ;;
 esac
 
-if [[ -z "$ISOLATION" ]]; then
-  if git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then ISOLATION=worktree; else ISOLATION=shared; fi
+if [[ "$MODE" == "inspect" ]]; then
+  ACTION_RULE="READ-ONLY TASK. Do not modify, create, delete, rename, commit, or format files. Inspect and report only."
+  MAX_TURNS="$CLAUDE_MAX_TURNS_INSPECT"
+else
+  ACTION_RULE="EDIT TASK. You may edit files required for the task. Do not commit. Keep changes tightly scoped and run the smallest relevant verification."
+  MAX_TURNS="$CLAUDE_MAX_TURNS_EDIT"
 fi
 
-WORKDIR="$CWD"
-WT_DIR=""
+mkdir -p "$RUNS_DIR"
+LEDGER="$RUNS_DIR/$(date +%F).jsonl"
+RUN_ID="$(date +%Y%m%d-%H%M%S)-${MODEL_KEY}-$(printf '%04x' $((RANDOM % 65536)))"
+RUN_DIR="$RUNS_DIR/$RUN_ID"
+mkdir -p "$RUN_DIR"
+
+# Task budget is cumulative across every call sharing a --task-id. A per-call cap alone
+# lets one goal escalate through five routes and spend five times the "limit".
+SPENT="$(python3 - "$RUNS_DIR" "$TASK_ID" <<'PY'
+import glob, json, os, sys
+runs_dir, task_id = sys.argv[1], sys.argv[2]
+total = 0.0
+for f in glob.glob(os.path.join(runs_dir, "*.jsonl")):
+    for line in open(f, errors="replace"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("task_id") == task_id and r.get("cost_usd"):
+            total += float(r["cost_usd"])
+print(f"{total:.6f}")
+PY
+)"
+
+BUDGET_STOP=""
+if [[ "$PROVIDER" == "claude" ]]; then
+  read -r BUDGET BUDGET_STOP < <(python3 - "$SPENT" "$AGY_TASK_BUDGET_USD" "$BUDGET" <<'PY'
+import sys
+spent, cap, call = (float(x) for x in sys.argv[1:4])
+remaining = cap - spent
+if remaining <= 0:
+    print(f"{call:.4f} exhausted")
+else:
+    print(f"{min(call, remaining):.4f} ok")
+PY
+)
+fi
+
+if [[ "$BUDGET_STOP" == "exhausted" ]]; then
+  echo "🛑 task budget exhausted for task-id '$TASK_ID': spent \$$SPENT of \$$AGY_TASK_BUDGET_USD" >&2
+  echo "   Raise AGY_TASK_BUDGET_USD in $CONFIG, or start a new --task-id." >&2
+  exit 3
+fi
+
+WORKDIR="$CWD"; WT_DIR=""
 cleanup() {
   if [[ -n "$WT_DIR" && "$KEEP_WORKTREE" -eq 0 ]]; then
     git -C "$CWD" worktree remove --force "$WT_DIR" >/dev/null 2>&1 || true
@@ -98,22 +260,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [[ -z "$ISOLATION" ]]; then
+  if git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then ISOLATION=worktree; else ISOLATION=shared; fi
+fi
 if [[ "$ISOLATION" == "worktree" ]]; then
-  git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "worktree isolation requires a Git repository" >&2; exit 2; }
+  git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "worktree isolation requires a Git repository"
   WT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agy-worker.XXXXXX")"
-  # Use detached worktree so concurrent workers do not contend on a branch.
+  # Detached worktree so concurrent workers do not contend on a branch.
   git -C "$CWD" worktree add --detach "$WT_DIR" HEAD >/dev/null
   WORKDIR="$WT_DIR"
 elif [[ "$ISOLATION" != "shared" ]]; then
-  echo "Invalid --isolation" >&2; exit 2
-fi
-
-if [[ "$MODE" == "inspect" ]]; then
-  ACTION_RULE="READ-ONLY TASK. Do not modify, create, delete, rename, commit, or format files. Inspect and report only."
-  MAX_TURNS="$CLAUDE_MAX_TURNS_INSPECT"
-else
-  ACTION_RULE="EDIT TASK. You may edit files required for the task. Do not commit. Keep changes tightly scoped and run the smallest relevant verification."
-  MAX_TURNS="$CLAUDE_MAX_TURNS_EDIT"
+  die "Invalid --isolation"
 fi
 
 PROMPT=$(cat <<PROMPT_EOF
@@ -137,7 +294,8 @@ Do not delegate to additional agents unless the task explicitly requests it.
 PROMPT_EOF
 )
 
-TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/agy-output.XXXXXX")"
+TXT_OUT="$RUN_DIR/worker.txt"
+RAW_OUT="$RUN_DIR/provider.raw"
 
 echo "========================================================"
 echo "🚀 [agy-worker] Starting: $ROLE"
@@ -145,21 +303,42 @@ echo "   Model:      $MODEL_KEY ($MODEL) via $PROVIDER"
 echo "   Mode:       $MODE"
 echo "   Isolation:  $ISOLATION"
 [[ "$PROVIDER" == "claude" ]] && echo "   Max turns:  $MAX_TURNS (mode=$MODE)"
+[[ "$PROVIDER" == "claude" ]] && echo "   Budget:     \$$BUDGET (task '$TASK_ID' spent \$$SPENT of \$$AGY_TASK_BUDGET_USD)"
+echo "   Run id:     $RUN_ID"
 echo "   Workdir:    $WORKDIR"
 echo "========================================================"
 
 # stdin is closed for the worker CLIs: both 'claude -p' and 'codex exec' otherwise
 # block reading additional input when launched from a non-interactive dispatcher.
 WORKER_EXIT=0
+COST_JSON="null"; TURNS_JSON="null"; SESSION_JSON="null"; STOP_JSON="null"
 set +e
 if [[ "$PROVIDER" == "claude" ]]; then
   command -v claude >/dev/null 2>&1 || { echo "Claude Code CLI 'claude' not found" >&2; exit 127; }
   (
     cd "$WORKDIR"
     claude -p --model "$MODEL" --max-turns "$MAX_TURNS" --max-budget-usd "$BUDGET" \
-      --permission-mode acceptEdits --output-format text "$PROMPT" < /dev/null
-  ) | tee "$TMP_OUT"
-  WORKER_EXIT=${PIPESTATUS[0]}
+      --permission-mode acceptEdits --output-format json "$PROMPT" < /dev/null
+  ) > "$RAW_OUT"
+  WORKER_EXIT=$?
+  # json output carries the report text plus the cost/turns the budget ledger needs.
+  eval "$(python3 - "$RAW_OUT" "$TXT_OUT" <<'PY'
+import json, shlex, sys
+raw, txt = sys.argv[1], sys.argv[2]
+try:
+    o = json.load(open(raw))
+except Exception:
+    open(txt, "w").write(open(raw, errors="replace").read())
+    print("COST_JSON=null TURNS_JSON=null SESSION_JSON=null STOP_JSON=null")
+    raise SystemExit
+open(txt, "w").write(str(o.get("result") or ""))
+def j(v):
+    return "null" if v is None else shlex.quote(json.dumps(v))
+print(f"COST_JSON={j(o.get('total_cost_usd'))} TURNS_JSON={j(o.get('num_turns'))} "
+      f"SESSION_JSON={j(o.get('session_id'))} STOP_JSON={j(o.get('stop_reason') or o.get('subtype'))}")
+PY
+)"
+  cat "$TXT_OUT"
 else
   command -v codex >/dev/null 2>&1 || { echo "Codex CLI 'codex' not found" >&2; exit 127; }
   # workspace-write is deliberately used in isolated worktrees. This avoids current
@@ -167,7 +346,7 @@ else
   (
     cd "$WORKDIR"
     codex exec --ephemeral -m "$MODEL" --sandbox workspace-write -C "$WORKDIR" "$PROMPT" < /dev/null
-  ) | tee "$TMP_OUT"
+  ) | tee "$TXT_OUT"
   WORKER_EXIT=${PIPESTATUS[0]}
 fi
 set -e
@@ -177,31 +356,65 @@ echo "========================================================"
 echo "✅ [agy-worker] Finished: $ROLE ($MODEL_KEY)"
 echo "========================================================"
 
-if [[ "$WORKER_EXIT" -ne 0 ]] && grep -q "Reached max turns" "$TMP_OUT" 2>/dev/null; then
+if [[ "$WORKER_EXIT" -ne 0 ]] && grep -q "Reached max turns" "$TXT_OUT" 2>/dev/null; then
   echo "hint: worker hit the ${MAX_TURNS}-turn cap for mode=$MODE." >&2
   echo "      Raise CLAUDE_MAX_TURNS_$(echo "$MODE" | tr '[:lower:]' '[:upper:]') in $CONFIG, or split the task." >&2
 fi
 
+DIFF_FILE="$RUN_DIR/worker.diff"
+: > "$DIFF_FILE"
+CHANGED=""
 if git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "$WORKDIR" add -A -- . >/dev/null 2>&1 || true
+  git -C "$WORKDIR" diff --cached --no-ext-diff --binary > "$DIFF_FILE" 2>/dev/null || true
+  CHANGED="$(git -C "$WORKDIR" diff --cached --name-only 2>/dev/null || true)"
+  git -C "$WORKDIR" reset >/dev/null 2>&1 || true
   echo
   echo "===== AGY_WORKER_GIT_DIFF ====="
   git -C "$WORKDIR" status --short || true
-  git -C "$WORKDIR" diff --no-ext-diff --binary || true
+  cat "$DIFF_FILE"
   echo "===== END_AGY_WORKER_GIT_DIFF ====="
 fi
 
-if [[ -n "$OUTPUT" ]]; then
-  mkdir -p "$(dirname "$OUTPUT")"
-  cp "$TMP_OUT" "$OUTPUT"
-fi
+[[ -n "$OUTPUT" ]] && { mkdir -p "$(dirname "$OUTPUT")"; cp "$TXT_OUT" "$OUTPUT"; }
+[[ -n "$WT_DIR" && "$KEEP_WORKTREE" -eq 1 ]] && echo "AGY_WORKTREE=$WT_DIR"
 
-if [[ -n "$WT_DIR" && "$KEEP_WORKTREE" -eq 1 ]]; then
-  echo "AGY_WORKTREE=$WT_DIR"
-fi
-rm -f "$TMP_OUT"
+python3 - "$RUN_DIR/result.json" "$LEDGER" <<PY
+import json, os, sys
+res_path, ledger = sys.argv[1], sys.argv[2]
+changed = [f for f in """$CHANGED""".split("\n") if f.strip()]
+rec = {
+    "run_id": "$RUN_ID",
+    "task_id": "$TASK_ID",
+    "ok": $WORKER_EXIT == 0,
+    "exit": $WORKER_EXIT,
+    "route": "$MODEL_KEY",
+    "provider": "$PROVIDER",
+    "model": "$MODEL",
+    "mode": "$MODE",
+    "isolation": "$ISOLATION",
+    "role": """$ROLE""",
+    "cwd": "$CWD",
+    "workdir": "$WORKDIR",
+    "max_turns": $MAX_TURNS,
+    "cost_usd": $COST_JSON,
+    "turns": $TURNS_JSON,
+    "session_id": $SESSION_JSON,
+    "stop_reason": $STOP_JSON,
+    "changed_files": changed,
+    "diff_path": "$DIFF_FILE" if os.path.getsize("$DIFF_FILE") else None,
+    "report_path": "$TXT_OUT",
+    "finished_at": __import__("datetime").datetime.now().astimezone().isoformat(),
+}
+json.dump(rec, open(res_path, "w"), ensure_ascii=False, indent=2)
+with open(ledger, "a") as fh:
+    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+PY
 
-# Final sentinel. It is always the last line of output, so a dispatcher can poll the
-# log and know the report is complete only once this line appears. Anything read
-# before it is a partial run and must not be reported as a worker result.
+rm -f "$RAW_OUT"
+echo
+echo "===== AGY_WORKER_RESULT $RUN_DIR/result.json ====="
+# Final sentinel. Always the last line, so a dispatcher knows the report is complete only
+# once it appears. Anything read before it is a partial run.
 echo "===== AGY_WORKER_END exit=$WORKER_EXIT ====="
 exit "$WORKER_EXIT"

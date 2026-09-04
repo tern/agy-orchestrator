@@ -194,18 +194,84 @@ agy-exec --model luna --mode inspect --task "Inspect this repository at a high l
 
 ```text
 agy-exec --model <haiku|sonnet|opus|luna|terra|sol> --task <text> [options]
+agy-exec apply <run-id> [--cwd <path>] [--check] [-- <file>...]
+agy-exec runs [--task-id <id>] [--limit <n>]
 
-Options:
+Delegate options:
   --model <name>               Model alias (haiku|sonnet|opus|luna|terra|sol)
   --task <text>                Task prompt for the worker
   --cwd <path>                 Working directory (default: pwd)
   --role <text>                Worker role label (e.g., research, implementation, review)
   --mode <inspect|edit>        inspect = read-only; edit = write-capable
   --isolation <worktree|shared> Default: worktree for Git repos, shared otherwise
+  --task-id <id>               Budget/ledger grouping key for one unit of work
+                               (default: <repo-basename>-<YYYYMMDD>)
   --output <path>              Save worker text output to a file
   --keep-worktree              Keep temporary worktree for manual inspection
   -h, --help                   Show help message
 ```
+
+### Result contract
+
+Every run records `~/.local/share/agy-orchestrator/runs/<run-id>/` with `result.json`,
+`worker.diff` and `worker.txt`, appends one line to `runs/<date>.jsonl`, and prints the
+result path as `===== AGY_WORKER_RESULT <path> =====` just before the sentinel.
+
+```json
+{
+  "run_id": "20260904-170556-haiku-32e1",
+  "task_id": "PAY-123",
+  "ok": true,
+  "exit": 0,
+  "route": "haiku",
+  "provider": "claude",
+  "mode": "edit",
+  "isolation": "worktree",
+  "max_turns": 60,
+  "cost_usd": 0.0388,
+  "turns": 4,
+  "session_id": "...",
+  "stop_reason": "end_turn",
+  "changed_files": ["greet.txt"],
+  "diff_path": ".../worker.diff",
+  "report_path": ".../worker.txt"
+}
+```
+
+**Take control decisions from this file, not from the prose report.** Whether the run
+finished, what it touched and what it cost are facts a worker cannot fabricate; a
+convincing report about work that never happened is exactly the failure this guards
+against. The prose still carries the content — findings, diagnosis, recommendation.
+
+Codex routes do not report USD, so `cost_usd` is `null` for them and they are not counted
+against the task budget.
+
+### Task budget
+
+`CLAUDE_BUDGET_*` caps a single call. `AGY_TASK_BUDGET_USD` caps the **sum** of every call
+sharing a `--task-id`, which is what stops one goal from escalating through five routes
+and spending five times the "limit". `agy-exec` clamps each call to the remaining balance
+and exits `3` once the budget is gone:
+
+```text
+🛑 task budget exhausted for task-id 'PAY-123': spent $10.02 of $10.00
+   Raise AGY_TASK_BUDGET_USD in ~/.config/agy-orchestrator/models.env, or start a new --task-id.
+```
+
+`agy-exec runs --task-id PAY-123` lists the runs and the spend so far.
+
+### Applying worker changes
+
+An edit worker's worktree is discarded when it finishes, but its diff is preserved.
+Integrate it explicitly rather than retyping the edit:
+
+```bash
+agy-exec apply <run-id> --check    # dry run
+agy-exec apply <run-id>            # three-way merge, staged, never committed
+```
+
+On conflict it stops and leaves the tree for you to resolve, exiting non-zero. A
+half-applied patch is worse than a refused one.
 
 ---
 

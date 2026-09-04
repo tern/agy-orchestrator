@@ -193,18 +193,79 @@ agy-exec --model luna --mode inspect --task "請高層次瀏覽此專案結構�
 
 ```text
 agy-exec --model <haiku|sonnet|opus|luna|terra|sol> --task <text> [options]
+agy-exec apply <run-id> [--cwd <path>] [--check] [-- <file>...]
+agy-exec runs [--task-id <id>] [--limit <n>]
 
-選項：
+委派選項：
   --model <name>               指定使用的模型別名 (haiku|sonnet|opus|luna|terra|sol)
   --task <text>                交給 worker 執行的任務內容
   --cwd <path>                 工作目錄 (預設為當前目錄 pwd)
   --role <text>                Worker 角色標籤 (如 implementation, reviewer)
   --mode <inspect|edit>        inspect: 唯讀模式 / edit: 允許編輯檔案
   --isolation <worktree|shared> 隔離模式 (Git 專案預設為 worktree，非 Git 專案降級為 shared)
+  --task-id <id>               預算與流水帳的歸戶鍵，代表「同一件工作」
+                               (預設：<repo 目錄名>-<YYYYMMDD>)
   --output <path>              將 worker 輸出報告儲存至特定檔案
   --keep-worktree              執行結束後保留臨時 worktree (便於手動檢查)
   -h, --help                   顯示說明資訊
 ```
+
+### 結果契約 (Result Contract)
+
+每次執行都會在 `~/.local/share/agy-orchestrator/runs/<run-id>/` 留下 `result.json`、
+`worker.diff` 與 `worker.txt`，並在 `runs/<日期>.jsonl` 附加一行流水帳；哨符前一行會印出
+`===== AGY_WORKER_RESULT <path> =====`。
+
+```json
+{
+  "run_id": "20260904-170556-haiku-32e1",
+  "task_id": "PAY-123",
+  "ok": true,
+  "exit": 0,
+  "route": "haiku",
+  "provider": "claude",
+  "mode": "edit",
+  "isolation": "worktree",
+  "max_turns": 60,
+  "cost_usd": 0.0388,
+  "turns": 4,
+  "session_id": "...",
+  "stop_reason": "end_turn",
+  "changed_files": ["greet.txt"],
+  "diff_path": ".../worker.diff",
+  "report_path": ".../worker.txt"
+}
+```
+
+**控制決策一律讀這個檔，不要讀散文報告。** 「跑完沒有」「動了哪些檔」「花了多少錢」是
+worker 偽造不了的事實；而一份關於從未發生過的工作的漂亮報告，正是這個機制要防的東西。
+散文報告仍然承載內容——審查發現、診斷、建議。
+
+Codex 路由不回報 USD，因此 `cost_usd` 為 `null`，也不計入任務預算。
+
+### 任務總預算
+
+`CLAUDE_BUDGET_*` 限制的是**單次呼叫**。`AGY_TASK_BUDGET_USD` 限制的是共用同一個
+`--task-id` 的**所有呼叫總和**——這才擋得住「一個目標升級五次、花掉五倍上限」。
+`agy-exec` 會把每次呼叫夾擠到剩餘額度，額度用盡時以 `3` 結束：
+
+```text
+🛑 task budget exhausted for task-id 'PAY-123': spent $10.02 of $10.00
+   Raise AGY_TASK_BUDGET_USD in ~/.config/agy-orchestrator/models.env, or start a new --task-id.
+```
+
+`agy-exec runs --task-id PAY-123` 可列出該任務的所有執行與累計花費。
+
+### 套用 Worker 的變更
+
+edit worker 的 worktree 結束即銷毀，但 diff 會被保留。請以指令明確整合，不要自己重打一遍：
+
+```bash
+agy-exec apply <run-id> --check    # 乾跑檢查
+agy-exec apply <run-id>            # 三方合併，只進 staging，絕不 commit
+```
+
+衝突時會停下並保留工作區交給你處理，以非零碼結束。半套用的 patch 比拒絕套用更糟。
 
 ---
 

@@ -42,6 +42,34 @@ To ensure the user can see real-time worker progress in the Agy CLI bottom statu
 - Set `Prompt` to instruct the subagent to execute `agy-exec` with the target options (`--model`, `--mode`, `--role`, `--task`) and return the resulting report and git diff. The prompt must also state the waiting contract explicitly: run only that command, poll until the log ends with `===== AGY_WORKER_END exit=... =====`, then return the full log verbatim, and never perform the task itself or answer from its own observations.
 - For parallel execution (e.g. simultaneous discovery and test survey), submit multiple items in the `Subagents` array of a single `invoke_subagent` call. All workers will be rendered concurrently in Agy's bottom statusline.
 
+## Reading a worker result
+
+Every `agy-exec` run writes `result.json` and prints its path as
+`===== AGY_WORKER_RESULT <path> =====` just before the sentinel. **Take control decisions
+from that file, not from the prose report**: whether the run finished (`ok`, `exit`,
+`stop_reason`), what it touched (`changed_files`, `diff_path`), and what it cost
+(`cost_usd`, `turns`). Prose is for content — a review's findings, a diagnosis, a
+recommendation — and a worker can write convincing prose about work it never did.
+
+Pass `--task-id <id>` on every delegation belonging to the same unit of work. Costs
+accumulate per task-id against `AGY_TASK_BUDGET_USD`; `agy-exec` clamps each call to the
+remaining balance and exits 3 once the budget is gone. Without a shared id each call gets
+its own ceiling and "cost-aware" means nothing. `agy-exec runs --task-id <id>` shows the
+spend so far.
+
+## Applying a worker's changes
+
+Edit workers run in a detached worktree, which is discarded when they finish; the diff is
+preserved at `diff_path`. Integrate it with:
+
+```bash
+agy-exec apply <run-id> --check    # dry run
+agy-exec apply <run-id>            # three-way merge into the main tree, staged not committed
+```
+
+`apply` stops on conflict rather than forcing a half-applied patch. Review the diff before
+applying, and never let a worker commit or push.
+
 ## Worker report validity
 
 `agy-exec` takes minutes. The `agy-worker` subagent is a `flash_lite` dispatch runner with
@@ -51,8 +79,9 @@ is tempted to run the task itself and present its own output as the worker's rep
 Treat a worker report as valid **only** when all of the following hold:
 
 - the report text contains `===== AGY_WORKER_END exit=0 =====`;
+- it names a `result.json` whose `ok` is true and whose `route` matches what you dispatched;
 - it contains the `🚀 [agy-worker] Starting:` banner naming the model you routed to;
-- for an edit task, it contains an `AGY_WORKER_GIT_DIFF` block.
+- for an edit task, `changed_files` is non-empty and a `diff_path` exists.
 
 If any is missing, the delegation did not complete. Say so, ask the subagent for the full
 task log, or re-dispatch. **Do not integrate, commit, or treat a review as passed on the
@@ -102,7 +131,9 @@ choose worktree isolation automatically for Git repositories; `shared` is only f
 inspect-only tasks that must observe the live working tree (for example reviewing
 uncommitted changes) or for non-Git directories.
 
-Treat their changes as proposals. Review their reported diff and reproduce/apply only accepted changes in the main workspace. Do not blindly merge worker output.
+Treat their changes as proposals. Review the diff at `diff_path`, then integrate with
+`agy-exec apply <run-id>` rather than retyping the edit yourself. Do not blindly merge
+worker output, and never commit code whose verification you have not run yourself.
 
 If the repository is not Git-backed, the bridge may fall back to shared execution; in that case minimize concurrent edit workers and inspect status/backups before changes.
 

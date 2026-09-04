@@ -12,4 +12,6 @@ for route in haiku sonnet opus luna terra sol; do
   fi
 done
 rm -rf "$HOME/.gemini/config/skills/model-router"
-echo "Removed executable, Agy agent and skill. Kept ~/.config/agy-orchestrator/models.env so custom model mappings are not lost."
+echo "Removed executable, Agy agents and skill."
+echo "Kept ~/.config/agy-orchestrator/models.env (custom model mappings)."
+echo "Kept ~/.local/share/agy-orchestrator/runs (result.json records and the cost ledger)."

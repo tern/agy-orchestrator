@@ -93,10 +93,26 @@ Default:
 
 If Sonnet authored important code, prefer Terra or Sol for independent review. If Terra authored important code, prefer Sonnet or Opus for review. Cross-family review is preferred for critical changes.
 
+## Result contract and budget
+
+Each run writes `result.json` (path echoed as `===== AGY_WORKER_RESULT <path> =====`).
+Control decisions come from it — `ok`, `exit`, `stop_reason`, `changed_files`,
+`diff_path`, `cost_usd`, `turns` — while the prose report carries the findings. A worker
+can write a convincing report about work it never did; it cannot fake a non-zero `exit`.
+
+Pass `--task-id <id>` on every call belonging to the same goal. Spend accumulates per
+task-id against `AGY_TASK_BUDGET_USD`; each call is clamped to the remaining balance and
+`agy-exec` exits 3 when the budget is gone. Escalating through five routes under one
+task-id therefore costs at most the task budget, not five per-call budgets.
+
+Integrate edit work with `agy-exec apply <run-id>` (add `--check` to dry-run). It
+three-way merges the preserved diff and stops on conflict.
+
 ## Completion gate
 
 Before reporting success, confirm:
 - every worker report you relied on carried the `AGY_WORKER_END` sentinel;
+- every result.json you acted on had `ok: true` and the route you dispatched;
 - intended change exists;
 - relevant tests/build/checks ran where feasible;
 - no unexplained new diff remains;
